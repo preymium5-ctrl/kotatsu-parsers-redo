@@ -121,13 +121,15 @@ internal class ProjectSuki(context: MangaLoaderContext) :
 
 	private fun parseBookSummary(bookId: String, container: Element, anchor: Element): Manga {
 		val title = sequenceOf(
-			container.selectFirst("img[alt]")?.attr("alt"),
-			anchor.text(),
 			container.select("a[href]")
 				.firstOrNull { it.absUrl("href").toBookId() == bookId && it.select("img").isEmpty() }
 				?.text(),
+			anchor.text(),
+			container.select("h1, h2, h3, h4, .title, [itemprop=name]").firstOrNull()?.text(),
+			container.selectFirst("img[title]")?.attr("title"),
+			container.selectFirst("img[alt]")?.attr("alt"),
 			container.text(),
-		).firstOrNull { !it.isNullOrBlank() && !it.equals("show more", ignoreCase = true) }
+		).firstOrNull { it.isValidBookTitle(bookId) }
 			?.trim()
 			?: bookId
 
@@ -149,6 +151,14 @@ internal class ProjectSuki(context: MangaLoaderContext) :
 			authors = emptySet(),
 			source = source,
 		)
+	}
+
+	private fun String?.isValidBookTitle(bookId: String): Boolean {
+		val value = this?.trim().orEmpty()
+		return value.isNotEmpty() &&
+			!value.equals(bookId, ignoreCase = true) &&
+			!value.equals("show more", ignoreCase = true) &&
+			!value.all(Char::isDigit)
 	}
 
 	override suspend fun getDetails(manga: Manga): Manga {

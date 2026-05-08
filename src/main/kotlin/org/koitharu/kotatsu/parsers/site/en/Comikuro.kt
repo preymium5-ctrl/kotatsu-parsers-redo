@@ -63,7 +63,6 @@ internal class Comikuro(context: MangaLoaderContext) : PagedMangaParser(context,
 		MangaListFilterCapabilities(
 			isSearchSupported = true,
 			isSearchWithFiltersSupported = true,
-			isMultipleTagsSupported = true,
 		)
 
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
@@ -72,7 +71,6 @@ internal class Comikuro(context: MangaLoaderContext) : PagedMangaParser(context,
 	}
 
 	override suspend fun getFilterOptions(): MangaListFilterOptions = MangaListFilterOptions(
-		availableTags = genres,
 		availableStates = EnumSet.of(
 			MangaState.ONGOING,
 			MangaState.FINISHED,
@@ -96,9 +94,6 @@ internal class Comikuro(context: MangaLoaderContext) : PagedMangaParser(context,
 
 			filter.query?.trim()?.nullIfEmpty()?.let {
 				addQueryParameter("q", it)
-			}
-			filter.tags.forEach {
-				addQueryParameter("genres", it.key)
 			}
 			filter.types.firstOrNull()?.toCountryParam()?.let {
 				addQueryParameter("country", it)
@@ -141,8 +136,9 @@ internal class Comikuro(context: MangaLoaderContext) : PagedMangaParser(context,
 			url = chapter.url.toAbsoluteUrl(domain),
 			readySelector = ".manga-reader-container img[src], .reader-page img[src]",
 		)
-		return document.select(".manga-reader-container img[src], .reader-page img[src]")
+		val pages = document.select(".manga-reader-container img[src], .reader-page img[src]")
 			.mapNotNull { it.attrAsAbsoluteUrlOrNull("src") }
+			.filter { it.startsWith("https://storage.comikuro.to/", ignoreCase = true) }
 			.distinct()
 			.map { imageUrl ->
 				MangaPage(
@@ -152,6 +148,10 @@ internal class Comikuro(context: MangaLoaderContext) : PagedMangaParser(context,
 					source = source,
 				)
 			}
+		if (pages.isEmpty() && isCloudflareChallengePage(document.outerHtml())) {
+			requestCloudflareVerification(chapter.url.toAbsoluteUrl(domain))
+		}
+		return pages
 	}
 
 	override suspend fun getPageUrl(page: MangaPage): String = page.url
@@ -222,7 +222,7 @@ internal class Comikuro(context: MangaLoaderContext) : PagedMangaParser(context,
 	}
 
 	private fun parseChapters(document: Document): List<MangaChapter> {
-		return document.select(".manga-chapters-grid a[href^=\"/read/\"]").mapChapters(reversed = true) { index, element ->
+		return document.select(".manga-chapters-grid a[href^=\"/read/\"], a[href^=\"/read/\"]:has(h3)").mapChapters(reversed = true) { index, element ->
 			val href = element.attrAsRelativeUrlOrNull("href") ?: return@mapChapters null
 			val title = element.selectFirst("h3")?.text()?.nullIfEmpty() ?: "Chapter ${index + 1}"
 			val scanlator = element.select("p").firstOrNull()?.text()?.nullIfEmpty()
@@ -260,17 +260,31 @@ internal class Comikuro(context: MangaLoaderContext) : PagedMangaParser(context,
 				const finish = () => {
 					if (resolved) return;
 					resolved = true;
-					window.stop();
 					resolve(document.documentElement.outerHTML);
 				};
-				const ready = () => document.querySelector('$readySelector');
+				const challengeDetected = () => {
+					const root = document.documentElement;
+					const lower = ((root && root.innerText) || '').toLowerCase();
+					return document.querySelector('script[src*="challenge-platform"]') !== null ||
+						document.getElementById('challenge-error-title') !== null ||
+						document.getElementById('challenge-error-text') !== null ||
+						document.querySelector('form[action*="__cf_chl"]') !== null ||
+						document.querySelector('.cf-browser-verification') !== null ||
+						((lower.includes('just a moment') || lower.includes('checking your browser')) && lower.includes('cloudflare')) ||
+						lower.includes('cf-chl-opt');
+				};
+				const ready = () => document.querySelector('$readySelector') !== null;
 				const startedAt = Date.now();
 				const tick = () => {
+					if (challengeDetected()) {
+						finish();
+						return;
+					}
 					if (ready() || Date.now() - startedAt > 12000) {
 						finish();
-					} else {
-						setTimeout(tick, 250);
+						return;
 					}
+					setTimeout(tick, 250);
 				};
 				if (document.readyState === 'complete' || document.readyState === 'interactive') {
 					tick();

@@ -15,7 +15,6 @@ internal class Mgkomik(context: MangaLoaderContext) :
 
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
-        keys.add(ConfigKey.InterceptCloudflare(defaultValue = true))
 		keys.add(userAgentKey)
 	}
 
@@ -24,6 +23,7 @@ internal class Mgkomik(context: MangaLoaderContext) :
 	override val datePattern = "dd MMM yy"
 	override val stylePage = ""
 	override val sourceLocale: Locale = Locale.ENGLISH
+    override val withoutAjax = true
 	private val randomLength = Random.Default.nextInt(13, 21)
 	private val randomString = generateRandomString(randomLength)
 	override fun getRequestHeaders(): Headers = Headers.Builder()
