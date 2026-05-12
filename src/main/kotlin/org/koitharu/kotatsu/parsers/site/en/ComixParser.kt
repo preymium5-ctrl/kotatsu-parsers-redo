@@ -312,7 +312,7 @@ internal class Comix(context: MangaLoaderContext) :
     }
 
     private suspend fun webViewChapterList(hashId: String): JSONArray {
-        val pathPrefix = "/api/v1/manga/$hashId/chapters?order%5Bnumber%5D=desc&limit=$CHAPTER_API_LIMIT&page="
+        val pathPrefix = "/api/v1/manga/$hashId/chapters?page="
         logDebug("webViewChapterList start hashId=$hashId prefix=$pathPrefix")
         val json = evaluateWebViewJson(
             label = "chapters:$hashId",
@@ -346,33 +346,50 @@ internal class Comix(context: MangaLoaderContext) :
                         return best;
                     };
                     const pagePath = (page, groupId) =>
-                        ${pathPrefix.toJsString()} + page + (groupId ? "&group_id=" + encodeURIComponent(groupId) : "");
+                        ${pathPrefix.toJsString()} + page +
+                            "&limit=$CHAPTER_API_LIMIT&order%5Bnumber%5D=desc" +
+                            (groupId ? "&group_id=" + encodeURIComponent(groupId) : "");
+
+                    const appendItems = (items) => {
+                        for (const item of items) all.push(compact(item));
+                    };
+                    const pageInfo = (result, fallbackPage) => {
+                        const pagination = (result && (result.pagination || result.meta)) || {};
+                        return {
+                            current: Number(pagination.page || pagination.current_page || fallbackPage),
+                            last: Number(pagination.lastPage || pagination.last_page || 1)
+                        };
+                    };
+
+                    const firstRoot = await fetchProtected(pagePath(1, ""));
+                    const firstResult = firstRoot && firstRoot.result ? firstRoot.result : firstRoot;
+                    const firstItems = firstResult && Array.isArray(firstResult.items) ? firstResult.items : [];
+                    if (!firstItems.length) {
+                        const keys = firstResult && typeof firstResult === "object" ? Object.keys(firstResult).join(",") : typeof firstResult;
+                        throw new Error("chapter payload has no items; keys=" + keys);
+                    }
+
+                    const groupId = mostActiveGroupId(firstItems);
+                    const firstPagination = pageInfo(firstResult, 1);
                     let page = 1;
-                    let groupId = "";
+                    if (!groupId) {
+                        appendItems(firstItems);
+                        page = firstPagination.current >= firstPagination.last ? $MAX_CHAPTER_API_PAGES + 1 : 2;
+                    }
                     while (page <= $MAX_CHAPTER_API_PAGES) {
                         const root = await fetchProtected(pagePath(page, groupId));
                         const result = root && root.result ? root.result : root;
                         const items = result && Array.isArray(result.items) ? result.items : [];
-                        if (page === 1 && !items.length) {
+                        if (!items.length && page === 1) {
                             const keys = result && typeof result === "object" ? Object.keys(result).join(",") : typeof result;
                             throw new Error("chapter payload has no items; keys=" + keys);
                         }
-                        if (page === 1) {
-                            groupId = mostActiveGroupId(items);
-                            if (groupId) {
-                                all.length = 0;
-                                page = 1;
-                                continue;
-                            }
-                        }
-                        for (const item of items) all.push(compact(item));
-                        const pagination = (result && (result.pagination || result.meta)) || {};
-                        const currentPage = Number(pagination.page || pagination.current_page || page);
-                        const lastPage = Number(pagination.lastPage || pagination.last_page || 1);
-                        if (!items.length || currentPage >= lastPage) break;
+                        appendItems(items);
+                        const pagination = pageInfo(result, page);
+                        if (!items.length || pagination.current >= pagination.last) break;
                         page++;
                     }
-                    return JSON.stringify({ items: all, debug: { pages: page, count: all.length, groupId } });
+                    return JSON.stringify({ items: all, debug: { pages: page, count: all.length, groupId, firstPageCount: firstItems.length } });
                 """.trimIndent(),
             ),
         )
@@ -542,19 +559,40 @@ internal class Comix(context: MangaLoaderContext) :
                         glue.installer(fakeAxios);
                     }
 
+                    const signCandidates = (apiPath) => {
+                        const withoutApi = apiPath.replace(/^\/api\/v1/, "");
+                        const withoutQuery = withoutApi.split("?")[0];
+                        const decoded = (() => {
+                            try { return decodeURIComponent(withoutApi); } catch (e) { return withoutApi; }
+                        })();
+                        return [...new Set([withoutApi, decoded, withoutQuery])];
+                    };
+
                     const fetchProtected = async (apiPath) => {
-                        const signablePath = apiPath.replace(/^\/api\/v1/, "");
-                        const sig = glue.signer(signablePath);
-                        if (!sig) throw new Error("signer returned empty token");
                         const sep = apiPath.indexOf("?") === -1 ? "?" : "&";
-                        const url = apiPath + sep + "_=" + encodeURIComponent(sig);
-                        const resp = await fetch(url, {
-                            credentials: "include",
-                            headers: { "Accept": "application/json", "X-Requested-With": "XMLHttpRequest" }
-                        });
-                        const text = await resp.text();
+                        let resp = null;
+                        let text = "";
+                        let signedUrl = "";
+                        let lastError = "";
+                        for (const signablePath of signCandidates(apiPath)) {
+                            const sig = glue.signer(signablePath);
+                            if (!sig) {
+                                lastError = "signer returned empty token";
+                                continue;
+                            }
+                            signedUrl = apiPath + sep + "_=" + encodeURIComponent(sig);
+                            resp = await fetch(signedUrl, {
+                                credentials: "include",
+                                headers: { "Accept": "application/json", "X-Requested-With": "XMLHttpRequest" }
+                            });
+                            text = await resp.text();
+                            if (resp.status >= 200 && resp.status < 300) break;
+                            lastError = "HTTP " + resp.status + " signed=" + signablePath + ": " + text.slice(0, 200);
+                            if (resp.status !== 422) break;
+                        }
+                        if (!resp) throw new Error(lastError || "request was not sent");
                         if (resp.status < 200 || resp.status >= 300) {
-                            throw new Error("HTTP " + resp.status + ": " + text.slice(0, 200));
+                            throw new Error(lastError || ("HTTP " + resp.status + ": " + text.slice(0, 200)));
                         }
                         const raw = JSON.parse(text);
                         if (raw && typeof raw === "object" && "e" in raw && captured.res) {
@@ -563,7 +601,7 @@ internal class Comix(context: MangaLoaderContext) :
                                 status: resp.status,
                                 statusText: resp.statusText,
                                 headers: Object.fromEntries([...resp.headers.entries()]),
-                                config: { url: url, method: "get", baseURL: "/api/v1" },
+                                config: { url: signedUrl, method: "get", baseURL: "/api/v1" },
                                 request: {}
                             };
                             const decoded = await captured.res(fakeResp);
@@ -702,7 +740,7 @@ internal class Comix(context: MangaLoaderContext) :
         private val RELATIVE_DATE_REGEX = Regex("""^(\d+)\s*(s|m|h|d|w|mo|mos|y|yr|yrs|min|mins|sec|secs|hr|hrs|day|days|week|weeks|month|months|year|years)$""")
         private val UNICODE_ESCAPE_REGEX = Regex("""\\u([0-9A-Fa-f]{4})""")
         private const val WEBVIEW_API_TIMEOUT = 90000L
-        private const val CHAPTER_API_LIMIT = 200
+        private const val CHAPTER_API_LIMIT = 100
         private const val MAX_CHAPTER_API_PAGES = 30
         private const val LOG_EXCERPT = 500
         private const val CLOUDFLARE_BLOCKED = "CLOUDFLARE_BLOCKED"
