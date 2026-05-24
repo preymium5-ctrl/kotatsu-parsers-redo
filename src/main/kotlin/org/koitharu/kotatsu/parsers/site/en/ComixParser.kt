@@ -497,7 +497,7 @@ internal class Comix(context: MangaLoaderContext) :
         return """
             (async () => {
                 const probePath = "/manga/g2rk/chapters";
-                const tokenRegex = /^[A-Za-z0-9_-]{40,200}$/;
+                const tokenRegex = /^[A-Za-z0-9_-]{20,200}$/;
                 const debugLog = [];
                 const debug = (message) => {
                     const line = "[COMIX_BRIDGE] " + message;
@@ -532,11 +532,20 @@ internal class Comix(context: MangaLoaderContext) :
                 const installNetworkLogging = () => {
                     if (window.__kotatsuComixNetworkLogInstalled) return;
                     window.__kotatsuComixNetworkLogInstalled = true;
+                    const requestUrlOf = (input) => {
+                        if (typeof input === "string") return input;
+                        if (input && typeof input.url === "string") return input.url;
+                        if (input && typeof input.href === "string") return input.href;
+                        try { return JSON.stringify(input); } catch (e) { return String(input); }
+                    };
+                    const requestMethodOf = (input, init) => {
+                        return (init && init.method) || (input && input.method) || "GET";
+                    };
                     const originalFetch = window.fetch;
                     if (typeof originalFetch === "function") {
                         window.fetch = async function(input, init) {
-                            const url = typeof input === "string" ? input : (input && input.url) || String(input);
-                            const method = (init && init.method) || (input && input.method) || "GET";
+                            const url = requestUrlOf(input);
+                            const method = requestMethodOf(input, init);
                             debug("fetch request method=" + method + " url=" + url);
                             try {
                                 const response = await originalFetch.apply(this, arguments);
