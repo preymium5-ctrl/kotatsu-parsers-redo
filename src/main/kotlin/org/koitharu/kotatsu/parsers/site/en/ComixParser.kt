@@ -504,6 +504,93 @@ internal class Comix(context: MangaLoaderContext) :
                     debugLog.push(message);
                     try { console.log(line); } catch (e) {}
                 };
+                const debugChunked = (prefix, text, limit) => {
+                    const value = String(text || "");
+                    const max = Math.min(value.length, limit || 2000);
+                    debug(prefix + " len=" + value.length + " excerpt=" + value.slice(0, max));
+                };
+                const logDocumentState = (stage) => {
+                    const root = document.documentElement;
+                    const html = (root && root.outerHTML) || "";
+                    const scripts = Array.from(document.scripts || [])
+                        .map((script) => script.src || "[inline:" + ((script.textContent || "").length) + "]")
+                        .slice(0, 20)
+                        .join(" | ");
+                    debug("document stage=" + stage + " readyState=" + document.readyState + " url=" + location.href + " title=" + document.title + " htmlLen=" + html.length);
+                    debug("document scripts stage=" + stage + " count=" + (document.scripts ? document.scripts.length : 0) + " first=" + scripts);
+                    debugChunked("document html stage=" + stage, html, 2500);
+                    try {
+                        const resources = performance.getEntriesByType("resource")
+                            .map((entry) => entry.initiatorType + " " + entry.name + " transfer=" + entry.transferSize + " duration=" + Math.round(entry.duration))
+                            .slice(-30)
+                            .join(" || ");
+                        debug("performance resources stage=" + stage + " " + resources);
+                    } catch (e) {
+                        debug("performance resources failed stage=" + stage + " error=" + String((e && e.message) || e));
+                    }
+                };
+                const installNetworkLogging = () => {
+                    if (window.__kotatsuComixNetworkLogInstalled) return;
+                    window.__kotatsuComixNetworkLogInstalled = true;
+                    const originalFetch = window.fetch;
+                    if (typeof originalFetch === "function") {
+                        window.fetch = async function(input, init) {
+                            const url = typeof input === "string" ? input : (input && input.url) || String(input);
+                            const method = (init && init.method) || (input && input.method) || "GET";
+                            debug("fetch request method=" + method + " url=" + url);
+                            try {
+                                const response = await originalFetch.apply(this, arguments);
+                                const clone = response.clone();
+                                clone.text().then((text) => {
+                                    debug("fetch response status=" + response.status + " ok=" + response.ok + " url=" + response.url + " bytes=" + text.length + " contentType=" + (response.headers.get("content-type") || ""));
+                                    debugChunked("fetch body url=" + response.url, text, 2500);
+                                }).catch((e) => {
+                                    debug("fetch body read failed url=" + response.url + " error=" + String((e && e.message) || e));
+                                });
+                                return response;
+                            } catch (e) {
+                                debug("fetch failed url=" + url + " error=" + String((e && e.stack) || (e && e.message) || e));
+                                throw e;
+                            }
+                        };
+                    } else {
+                        debug("fetch logger skipped: window.fetch missing");
+                    }
+                    const OriginalXHR = window.XMLHttpRequest;
+                    if (typeof OriginalXHR === "function") {
+                        window.XMLHttpRequest = function() {
+                            const xhr = new OriginalXHR();
+                            let method = "";
+                            let url = "";
+                            const originalOpen = xhr.open;
+                            xhr.open = function(m, u) {
+                                method = m;
+                                url = String(u);
+                                debug("xhr request method=" + method + " url=" + url);
+                                return originalOpen.apply(xhr, arguments);
+                            };
+                            xhr.addEventListener("loadend", function() {
+                                let text = "";
+                                try {
+                                    if (!xhr.responseType || xhr.responseType === "text" || xhr.responseType === "json") {
+                                        text = String(xhr.responseText || "");
+                                    } else {
+                                        text = "[responseType=" + xhr.responseType + "]";
+                                    }
+                                } catch (e) {
+                                    text = "[response unavailable: " + String((e && e.message) || e) + "]";
+                                }
+                                debug("xhr response status=" + xhr.status + " url=" + url + " bytes=" + text.length + " contentType=" + (xhr.getResponseHeader("content-type") || ""));
+                                debugChunked("xhr body url=" + url, text, 2500);
+                            });
+                            return xhr;
+                        };
+                        window.XMLHttpRequest.prototype = OriginalXHR.prototype;
+                    } else {
+                        debug("xhr logger skipped: XMLHttpRequest missing");
+                    }
+                    debug("network logging installed");
+                };
                 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
                 const challengeDetected = () => {
                     const root = document.documentElement;
@@ -573,7 +660,11 @@ internal class Comix(context: MangaLoaderContext) :
                 };
 
                 try {
+                    installNetworkLogging();
                     debug("boot href=" + location.href + " title=" + document.title);
+                    logDocumentState("boot");
+                    window.addEventListener("load", () => logDocumentState("window-load"), { once: true });
+                    window.addEventListener("pageshow", () => logDocumentState("pageshow"), { once: true });
                     let glue = null;
                     for (let attempt = 0; attempt < 80; attempt++) {
                         if (challengeDetected()) {
@@ -584,6 +675,7 @@ internal class Comix(context: MangaLoaderContext) :
                         if (glue) break;
                         if (attempt === 0 || attempt % 10 === 9) {
                             debug("glue not found attempt=" + (attempt + 1) + " windowKeys=" + Object.keys(window).length);
+                            logDocumentState("attempt-" + (attempt + 1));
                         }
                         await sleep(250);
                     }
