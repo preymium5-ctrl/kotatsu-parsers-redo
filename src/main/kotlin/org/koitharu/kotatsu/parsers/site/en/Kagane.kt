@@ -59,6 +59,27 @@ internal class Kagane(context: MangaLoaderContext) :
         "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
     )
 
+    // ---- Debug logging (grep logcat for "KAGANE_DBG") ----
+    private fun dbg(msg: String) = println("KAGANE_DBG: $msg")
+
+    private fun ByteArray.headHex(n: Int = 16): String =
+        take(n).joinToString(" ") { "%02x".format(it.toInt() and 0xFF) }
+
+    private fun signedMessageType(bytes: ByteArray): String {
+        // Widevine SignedMessage: field 1 (tag 0x08) = type varint
+        if (bytes.size >= 2 && bytes[0].toInt() == 0x08) {
+            return when (bytes[1].toInt() and 0xFF) {
+                1 -> "LICENSE_REQUEST(1)"
+                2 -> "LICENSE(2)"
+                3 -> "ERROR_RESPONSE(3)"
+                4 -> "SERVICE_CERTIFICATE_REQUEST(4)"
+                5 -> "SERVICE_CERTIFICATE(5)"
+                else -> "type=${bytes[1].toInt() and 0xFF}"
+            }
+        }
+        return "unknown(${bytes.headHex(4)})"
+    }
+
     override suspend fun getFilterOptions(): MangaListFilterOptions {
         val genres = genresCache ?: fetchGenres().also { genresCache = it }
         return MangaListFilterOptions(
@@ -365,11 +386,15 @@ internal class Kagane(context: MangaLoaderContext) :
             ?.substringAfter("=")
             ?.toIntOrNull() ?: 0
 
+        dbg("getPages start seriesId=$seriesId chapterId=$chapterId pageCount=$pageCount url=${chapter.url}")
+
         // 1. Fetch optional Widevine server certificate
         val cert = getCertificate().orEmpty()
+        dbg("certificate base64Len=${cert.length} (empty=${cert.isEmpty()})")
 
         // 2. Generate PSSH
         val pssh = getPssh(chapterId)
+        dbg("pssh=$pssh")
 
         // 3. Construct JS
         val script = """
@@ -413,8 +438,29 @@ internal class Kagane(context: MangaLoaderContext) :
                     }
 
                     const promise = new Promise((resolve, reject) => {
+                        let fallback = null;
+                        let settled = false;
+                        const settle = (msg) => {
+                            if (settled) return;
+                            settled = true;
+                            resolve(msg);
+                        };
                         session.addEventListener("message", (event) => {
-                             resolve(event.message);
+                            // The CDM can first emit a service-certificate /
+                            // individualization request (Widevine SignedMessage
+                            // type 4) which is NOT a valid license challenge.
+                            // Always prefer the real license request (type 1).
+                            if (event.messageType === "license-request") {
+                                settle(event.message);
+                                return;
+                            }
+                            // Keep the first non-license message as a fallback and
+                            // wait briefly in case the license request follows, so
+                            // we never hang nor regress to no challenge at all.
+                            if (fallback === null) {
+                                fallback = event.message;
+                                setTimeout(() => settle(fallback), 2000);
+                            }
                         });
                         session.addEventListener("error", (err) => {
                              reject(err);
@@ -451,16 +497,22 @@ internal class Kagane(context: MangaLoaderContext) :
 
         val interceptUrl = "https://$domain/series/$seriesId/$chapterId"
         val requests = context.interceptWebViewRequests(interceptUrl, config)
+        dbg("interception captured=${requests.size} resultUrl=${requests.firstOrNull()?.url}")
 
         val resultRequest = requests.firstOrNull() ?: throw Exception("Failed to intercept DRM challenge")
 
         if (resultRequest.url.contains("/error")) {
             val errorMsg = resultRequest.getQueryParameter("msg") ?: "Unknown error"
+            dbg("DRM JS error: $errorMsg")
             throw Exception("DRM JS Error: $errorMsg")
         }
 
         val challengeEncoded = resultRequest.getQueryParameter("challenge") ?: throw Exception("No challenge in interception")
         val challenge = URLDecoder.decode(challengeEncoded, StandardCharsets.UTF_8.name())
+        runCatching {
+            val challengeBytes = Base64.getDecoder().decode(challenge)
+            dbg("challenge b64Len=${challenge.length} decodedLen=${challengeBytes.size} smType=${signedMessageType(challengeBytes)} head=${challengeBytes.headHex()}")
+        }.onFailure { dbg("challenge b64Len=${challenge.length} (not base64-decodable: ${it.message})") }
 
         // 5. POST to API to get token
         val challengeUrl = "$apiUrl/api/v2/books/$chapterId?is_datasaver=false"
@@ -468,6 +520,7 @@ internal class Kagane(context: MangaLoaderContext) :
         jsonBody.put("challenge", challenge)
 
         val integrityToken = getIntegrityToken()
+        dbg("integrityToken len=${integrityToken.length} POST $challengeUrl body=$jsonBody")
         val headers = getRequestHeaders().newBuilder()
             .add("Origin", "https://$domain")
             .add("Referer", "https://$domain/")
@@ -475,12 +528,14 @@ internal class Kagane(context: MangaLoaderContext) :
             .build()
 
         val responseBody = webClient.httpPost(challengeUrl.toHttpUrl(), jsonBody, headers).parseRaw()
+        dbg("token response body (len=${responseBody.length}): $responseBody")
 
         val tokenResponse = try {
             JSONObject(responseBody)
         } catch (e: Exception) {
             throw Exception("Invalid JSON token response: $responseBody")
         }
+        dbg("token response keys=${tokenResponse.keys().asSequence().toList()}")
 
         val token = tokenResponse.optString("access_token").ifBlank {
             tokenResponse.optString("accessToken")
@@ -493,7 +548,10 @@ internal class Kagane(context: MangaLoaderContext) :
             throw Exception("Invalid token response: missing cache url")
         }
 
+        dbg("token=${token.take(24)}... cacheUrl=$currentCacheUrl")
+
         val pagesJson = tokenResponse.optJSONArray("pages")
+        dbg("pages array present=${pagesJson != null} length=${pagesJson?.length() ?: 0} firstEntry=${pagesJson?.opt(0)}")
         if (pagesJson != null && pagesJson.length() > 0) {
             val pages = (0 until pagesJson.length()).mapNotNull { index ->
                 val pageEntry = pagesJson.opt(index)
@@ -515,6 +573,7 @@ internal class Kagane(context: MangaLoaderContext) :
                 )
             }
             if (pages.isNotEmpty()) {
+                dbg("PATH=pages-array count=${pages.size} sample=${pages.take(3).map { it.url }}")
                 return pages
             }
         }
@@ -524,6 +583,7 @@ internal class Kagane(context: MangaLoaderContext) :
             ?: tokenResponse.optJSONObject("file_mapping")
             ?: tokenResponse.optJSONObject("fileMapping")
             ?: tokenResponse.optJSONObject("files")
+        dbg("mappingJson present=${mappingJson != null} keys=${mappingJson?.keys()?.asSequence()?.toList()}")
         val mapping = mutableMapOf<Int, String>()
         mappingJson?.keys()?.forEach { key ->
             val idx = key.toIntOrNull()
@@ -534,7 +594,7 @@ internal class Kagane(context: MangaLoaderContext) :
         if (totalPages <= 0) {
             throw Exception("Unable to parse pages from token response")
         }
-        return (0 until totalPages).map { index ->
+        val result = (0 until totalPages).map { index ->
             val pageIndex = index + 1
             val fileId = mapping[pageIndex]
                 ?: mapping[index]
@@ -547,6 +607,8 @@ internal class Kagane(context: MangaLoaderContext) :
                 source = source,
             )
         }
+        dbg("PATH=${if (mapping.isEmpty()) "FALLBACK-%04d.jpg" else "mapping"} totalPages=$totalPages mappingSize=${mapping.size} sample=${result.take(3).map { it.url }}")
+        return result
     }
 
     private var cachedCert: String? = null
@@ -567,9 +629,21 @@ internal class Kagane(context: MangaLoaderContext) :
 
         val response = runCatching {
             context.httpClient.newCall(req).await()
-        }.getOrNull() ?: return null
-        if (!response.isSuccessful) return null
-        val bytes = response.body?.bytes()?.takeIf { it.isNotEmpty() } ?: return null
+        }.getOrNull()
+        if (response == null) {
+            dbg("bin.bin fetch failed (network)")
+            return null
+        }
+        if (!response.isSuccessful) {
+            dbg("bin.bin http ${response.code}")
+            return null
+        }
+        val bytes = response.body?.bytes()?.takeIf { it.isNotEmpty() }
+        if (bytes == null) {
+            dbg("bin.bin empty body")
+            return null
+        }
+        dbg("bin.bin ok bytes=${bytes.size} head=${bytes.headHex()}")
 
         val b64 = Base64.getEncoder().encodeToString(bytes)
         cachedCert = b64
@@ -681,22 +755,31 @@ internal class Kagane(context: MangaLoaderContext) :
                 val seriesId = url.queryParameter("sid").orEmpty()
                 val seriesKey = if (seriesId.isBlank()) chapterId else seriesId
                 val index = url.queryParameter("index")?.toIntOrNull() ?: return chain.proceed(chain.request())
+                val fileName = pathSegments.last()
                 val imageResp = chain.proceed(chain.request())
-                if (!imageResp.isSuccessful) return imageResp
+                if (!imageResp.isSuccessful) {
+                    dbg("IMG http=${imageResp.code} file=$fileName index=$index chapterId=$chapterId")
+                    return imageResp
+                }
 
                 val contentType = imageResp.body?.contentType()
                 val imageBytes = imageResp.body?.bytes() ?: return imageResp
+                dbg("IMG ok file=$fileName index=$index len=${imageBytes.size} ct=$contentType head=${imageBytes.headHex()}")
 
                 try {
                     val decrypted = decryptImage(imageBytes, seriesKey, chapterId)
+                    dbg("  decryptImage ${if (decrypted == null) "FAILED(null)" else "ok len=${decrypted.size} head=${decrypted.headHex()}"}")
                     val processed = decrypted?.let {
                         processData(it, index, seriesKey, chapterId)
                     }
+                    dbg("  processData -> ${if (processed == null) "null(invalid)" else "ok len=${processed.size} head=${processed.headHex()}"}")
                     val outputBytes = processed ?: imageBytes
+                    dbg("  IMG output file=$fileName usedDecrypted=${processed != null} outLen=${outputBytes.size}")
                     return imageResp.newBuilder()
                         .body(outputBytes.toResponseBody(contentType))
                         .build()
-                } catch (_: Exception) {
+                } catch (e: Exception) {
+                    dbg("  IMG decrypt EXCEPTION file=$fileName ${e.message}")
                     return imageResp.newBuilder()
                         .body(imageBytes.toResponseBody(contentType))
                         .build()
