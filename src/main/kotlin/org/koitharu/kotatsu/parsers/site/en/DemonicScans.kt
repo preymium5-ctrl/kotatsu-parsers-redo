@@ -15,6 +15,8 @@ import java.util.*
 internal class DemonicScans(context: MangaLoaderContext) :
     PagedMangaParser(context, MangaParserSource.DEMONICSCANS, 25) {
 
+    private val tagsMap by lazy { fetchTags().associate { it.title.lowercase() to it.key } }
+
     override val configKeyDomain = ConfigKey.Domain("demonicscans.org")
 
     override val availableSortOrders: Set<SortOrder> = EnumSet.of(
@@ -49,7 +51,7 @@ internal class DemonicScans(context: MangaLoaderContext) :
                 append("&orderby=NAME ASC")
                 if (filter.tags.isNotEmpty()) {
                     filter.tags.forEach { tag ->
-                        append("&genre[]=")
+                        append("&genres[]=")
                         append(tag.key)
                     }
                 }
@@ -61,7 +63,7 @@ internal class DemonicScans(context: MangaLoaderContext) :
                 append("&orderby=NAME DESC")
                 if (filter.tags.isNotEmpty()) {
                     filter.tags.forEach { tag ->
-                        append("&genre[]=")
+                        append("&genres[]=")
                         append(tag.key)
                     }
                 }
@@ -73,7 +75,7 @@ internal class DemonicScans(context: MangaLoaderContext) :
                 append("&orderby=VIEWS DESC")
                 if (filter.tags.isNotEmpty()) {
                     filter.tags.forEach { tag ->
-                        append("&genre[]=")
+                        append("&genres[]=")
                         append(tag.key)
                     }
                 }
@@ -182,8 +184,10 @@ internal class DemonicScans(context: MangaLoaderContext) :
         return manga.copy(
             title = title,
             coverUrl = thumbnail,
-            tags = genre.split(", ").filter { it.isNotBlank() }.mapToSet {
-                MangaTag(title = it.lowercase().replace(" ", "-").toTitleCase(sourceLocale), key = it, source)
+            tags = genre.split(", ").filter { it.isNotBlank() }.mapToSet { tagText ->
+                val cleanedTitle = tagText.lowercase().replace(" ", "-").toTitleCase(sourceLocale)
+                val key = tagsMap[cleanedTitle.lowercase()] ?: tagText
+                MangaTag(title = cleanedTitle, key = key, source = source)
             },
             description = description,
             state = state,
@@ -194,14 +198,18 @@ internal class DemonicScans(context: MangaLoaderContext) :
 
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val doc = webClient.httpGet(chapter.url).parseHtml()
-        return doc.select("div > img.imgholder").map {
+        return doc.select("img.imgholder").mapNotNull {
             val url = it.requireSrc()
-            MangaPage(
-                id = generateUid(url),
-                url = url,
-                preview = null,
-                source = source
-            )
+            if (url.startsWith("/img/") || url.contains("ads") || !url.startsWith("http")) {
+                null
+            } else {
+                MangaPage(
+                    id = generateUid(url),
+                    url = url,
+                    preview = null,
+                    source = source
+                )
+            }
         }
     }
 
