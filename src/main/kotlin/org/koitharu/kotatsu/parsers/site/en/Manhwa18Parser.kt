@@ -21,7 +21,7 @@ import org.koitharu.kotatsu.parsers.util.suspendlazy.suspendLazy
 import java.text.SimpleDateFormat
 import java.util.*
 
-@MangaSourceParser("MANHWA18", "Manhwa18.cc", "en", type = ContentType.HENTAI)
+@MangaSourceParser("MANHWA18", "Manhwa18.net", "en", type = ContentType.HENTAI)
 internal class Manhwa18Parser(context: MangaLoaderContext) :
 	PagedMangaParser(context, MangaParserSource.MANHWA18, pageSize = 18, searchPageSize = 18), Interceptor {
 
