@@ -8,4 +8,4 @@ import org.koitharu.kotatsu.parsers.site.madara.MadaraParser
 
 @MangaSourceParser("YAOIHUB", "YaoiHub", "en", ContentType.HENTAI)
 internal class YaoiHub(context: MangaLoaderContext) :
-	MadaraParser(context, MangaParserSource.YAOIHUB, "yaoihub.com")
+	MadaraParser(context, MangaParserSource.YAOIHUB, "yaoihub.org")

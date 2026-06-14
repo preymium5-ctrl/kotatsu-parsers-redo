@@ -8,7 +8,7 @@ import org.koitharu.kotatsu.parsers.site.madara.MadaraParser
 
 @MangaSourceParser("PORNCOMIXONLINE", "PornComix.online", "en", ContentType.HENTAI)
 internal class PornComixOnline(context: MangaLoaderContext) :
-	MadaraParser(context, MangaParserSource.PORNCOMIXONLINE, "porncomix.online") {
+	MadaraParser(context, MangaParserSource.PORNCOMIXONLINE, "bestporncomix.com") {
 	override val listUrl = "comic/"
 	override val tagPrefix = "comic-genre/"
 	override val stylePage = ""
