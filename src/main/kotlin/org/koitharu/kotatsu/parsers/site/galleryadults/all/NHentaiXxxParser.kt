@@ -11,7 +11,7 @@ import org.koitharu.kotatsu.parsers.site.galleryadults.GalleryAdultsParser
 import org.koitharu.kotatsu.parsers.util.*
 import java.util.*
 
-@MangaSourceParser("NHENTAI_XXX", "NHentai.xxx", type = ContentType.HENTAI)
+@MangaSourceParser("NHENTAI_XXX", "NHentai.xxx", locale = "en", type = ContentType.HENTAI)
 internal class NHentaiXxxParser(context: MangaLoaderContext) :
 	GalleryAdultsParser(context, MangaParserSource.NHENTAI_XXX, "nhentai.xxx", 25) {
 
@@ -55,9 +55,9 @@ internal class NHentaiXxxParser(context: MangaLoaderContext) :
 			}
 
 			when {
-				lang != null -> {
+				tags.isEmpty() && filter.query.isNullOrEmpty() -> {
 					append("/language/")
-					append(lang.toLanguagePath())
+					append((lang ?: Locale.ENGLISH).toLanguagePath())
 					append("/?")
 				}
 

@@ -29,7 +29,7 @@ import java.util.Locale
 import kotlin.math.min
 
 @OptIn(ExperimentalUnsignedTypes::class)
-@MangaSourceParser("HITOMILA", "Hitomi.La", type = ContentType.HENTAI)
+@MangaSourceParser("HITOMILA", "Hitomi.La", locale = "en", type = ContentType.HENTAI)
 internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser(context, MangaParserSource.HITOMILA) {
 	override val configKeyDomain = ConfigKey.Domain("hitomi.la")
 
@@ -85,13 +85,10 @@ internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser
 
 	override suspend fun getFilterOptions() = MangaListFilterOptions(
 		availableTags = fetchAvailableTags(),
-		availableLocales = localeMap.keys,
+		availableLocales = emptySet(),
 	)
 
-	private fun Locale?.getSiteLang(): String = when (this) {
-		null -> "all"
-		else -> localeMap[this] ?: "all"
-	}
+	private fun Locale?.getSiteLang(): String = "english"
 
 	private suspend fun fetchAvailableTags(): Set<MangaTag> = coroutineScope {
 		('a'..'z').map { alphabet ->
@@ -199,7 +196,7 @@ internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser
 	private suspend fun hitomiSearch(
 		query: String,
 		sortByPopularity: SortOrder = SortOrder.UPDATED,
-		language: String = "all",
+		language: String = "english",
 	): Set<Int> =
 		coroutineScope {
 			val terms = query
@@ -275,7 +272,7 @@ internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser
 	// search.js
 	private suspend fun getGalleryIDsForQuery(
 		query: String,
-		language: String = "all",
+		language: String = "english",
 	): Set<Int> {
 		query.replace("_", " ").let {
 			if (it.indexOf(':') > -1) {
@@ -284,7 +281,7 @@ internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser
 				var tag = sides[1]
 
 				var area: String? = ns
-				var lang = language
+				var lang = "english"
 				when (ns) {
 					"female", "male" -> {
 						area = "tag"
@@ -293,7 +290,6 @@ internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser
 
 					"language" -> {
 						area = null
-						lang = tag
 						tag = "index"
 					}
 				}
@@ -544,13 +540,12 @@ internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser
 			.parseRaw()
 			.substringAfter("var galleryinfo = ")
 			.let(::JSONObject)
-		val author =
-			json.optJSONArray("artists")
-				?.mapJSON { it.getString("artist").toCamelCase() }
-				?.joinToString()
+		val artists = json.namesFromArray("artists", "artist")
+		val groups = json.namesFromArray("groups", "group")
 
 		return manga.copy(
 			title = json.getString("title"),
+			description = json.buildDescription(artists, groups),
 			largeCoverUrl =
 				json.getJSONArray("files").getJSONObject(0).let {
 					val hash = it.getString("hash")
@@ -559,7 +554,7 @@ internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser
 
 					"https://${subDomain}tn.$cdnDomain/webpbigtn/${thumbPathFromHash(hash)}/$hash.webp"
 				},
-			authors = setOfNotNull(author),
+			authors = artists + groups,
 			publicUrl = json.getString("galleryurl").toAbsoluteUrl(domain),
 			tags =
 				buildSet
@@ -617,6 +612,40 @@ internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser
 			).let(tags::add)
 		}
 		return tags
+	}
+
+	private fun JSONObject.namesFromArray(arrayName: String, valueName: String): Set<String> {
+		return optJSONArray(arrayName)
+			?.mapJSON { it.getString(valueName).toCamelCase() }
+			?.filter { it.isNotBlank() }
+			?.toSet()
+			.orEmpty()
+	}
+
+	private fun JSONObject.buildDescription(artists: Set<String>, groups: Set<String>): String {
+		val values = ArrayList<String>(8)
+		getStringOrNull("title")?.takeIf { it.isNotBlank() }?.let(values::add)
+		getStringOrNull("type")?.takeIf { it.isNotBlank() }?.toTitleCase()?.let { values += "Type: $it" }
+		getStringOrNull("language_localname")?.takeIf { it.isNotBlank() }?.let { values += "Language: $it" }
+		if (artists.isNotEmpty()) {
+			values += "Artist: ${artists.joinToString()}"
+		}
+		if (groups.isNotEmpty()) {
+			values += "Group: ${groups.joinToString()}"
+		}
+		val parodies = namesFromArray("parodys", "parody")
+		if (parodies.isNotEmpty()) {
+			values += "Parody: ${parodies.joinToString()}"
+		}
+		val characters = namesFromArray("characters", "character")
+		if (characters.isNotEmpty()) {
+			values += "Characters: ${characters.joinToString()}"
+		}
+		val tags = namesFromArray("tags", "tag").take(12)
+		if (tags.isNotEmpty()) {
+			values += "Tags: ${tags.joinToString()}"
+		}
+		return values.joinToString(separator = "\n").ifBlank { getString("title") }
 	}
 
 	private fun String.tagUrlToTag(): String {

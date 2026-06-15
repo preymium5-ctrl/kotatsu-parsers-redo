@@ -10,7 +10,7 @@ import org.koitharu.kotatsu.parsers.site.galleryadults.GalleryAdultsParser
 import org.koitharu.kotatsu.parsers.util.*
 import java.util.*
 
-@MangaSourceParser("NHENTAI_TO", "NHentai.to", type = ContentType.HENTAI)
+@MangaSourceParser("NHENTAI_TO", "NHentai.to", locale = "en", type = ContentType.HENTAI)
 internal class NHentaiToParser(context: MangaLoaderContext) :
 	GalleryAdultsParser(context, MangaParserSource.NHENTAI_TO, "nhentai.to", 25) {
 	override val selectGallery = "div.index-container:not(.index-popular) .gallery, #related-container .gallery"
@@ -42,27 +42,24 @@ internal class NHentaiToParser(context: MangaLoaderContext) :
 			append("https://")
 			append(domain)
 			when {
-				filter.tags.isEmpty() && filter.locale == null -> {
+				filter.tags.isEmpty() && filter.locale == null && !filter.query.isNullOrEmpty() -> {
 					append("/search/?q=")
-					append(if (filter.query.isNullOrEmpty()) "" else filter.query.urlEncoded())
+					append(filter.query.urlEncoded())
 					append("&")
 				}
 
 				else -> {
 					val tag = filter.tags.oneOrThrowIfMany()
-					val lang = filter.locale
-					if (tag != null && lang != null) {
+					if (tag != null && filter.locale != null) {
 						throw IllegalArgumentException(ErrorMessages.FILTER_BOTH_LOCALE_GENRES_NOT_SUPPORTED)
 					}
 					if (tag != null) {
 						append("/tag/")
 						append(tag.key)
 						append("/?")
-					} else if (filter.locale != null) {
-						append("/language/")
-						append(filter.locale.toLanguagePath())
-						append("/?")
 					} else {
+						append("/language/")
+						append((filter.locale ?: Locale.ENGLISH).toLanguagePath())
 						append("/?")
 					}
 				}

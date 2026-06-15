@@ -11,7 +11,7 @@ import org.koitharu.kotatsu.parsers.site.galleryadults.GalleryAdultsParser
 import org.koitharu.kotatsu.parsers.util.*
 import java.util.*
 
-@MangaSourceParser("NHENTAI", "NHentai.net", type = ContentType.HENTAI)
+@MangaSourceParser("NHENTAI", "NHentai.net", locale = "en", type = ContentType.HENTAI)
 internal class NHentaiParser(context: MangaLoaderContext) :
 	GalleryAdultsParser(context, MangaParserSource.NHENTAI, "nhentai.net", 25) {
 	override val selectGallery = ""
@@ -300,11 +300,10 @@ internal class NHentaiParser(context: MangaLoaderContext) :
 			joiner.append(tag.key)
 			joiner.append("\"")
 		}
-		language?.let { lc ->
-			joiner.add("language:\"")
-			joiner.append(lc.toLanguagePath())
-			joiner.append("\"")
-		}
+		val languagePath = (language ?: Locale.ENGLISH).toLanguagePath()
+		joiner.add("language:\"")
+		joiner.append(languagePath)
+		joiner.append("\"")
 		return joiner.complete()
 	}
 }
