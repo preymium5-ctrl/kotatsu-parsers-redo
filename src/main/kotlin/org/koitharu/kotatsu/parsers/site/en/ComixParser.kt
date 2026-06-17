@@ -99,8 +99,8 @@ internal class Comix(context: MangaLoaderContext) :
     }
 
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
-        val url = buildString {
-            append(apiUrl("manga"))
+        val apiPath = buildString {
+            append("/api/v1/manga")
             append("?")
             var firstParam = true
             fun addParam(param: String) {
@@ -150,7 +150,7 @@ internal class Comix(context: MangaLoaderContext) :
             addParam("page=$page")
         }
 
-        val response = getApiJson(url)
+        val response = webViewApiJson(apiPath)
         val result = response.getJSONObject("result")
         val items = result.getJSONArray("items")
 
@@ -202,7 +202,7 @@ internal class Comix(context: MangaLoaderContext) :
         val hashId = manga.url.substringAfter("/title/")
         val chaptersDeferred = async { getChapters(manga) }
 
-        val response = getApiJson(apiUrl("manga/$hashId"))
+        val response = webViewApiJson("/api/v1/manga/$hashId")
 
         if (response.has("result")) {
             val result = response.getJSONObject("result")
@@ -386,21 +386,6 @@ internal class Comix(context: MangaLoaderContext) :
         return response.optJSONArray("items") ?: JSONArray()
     }
 
-    private fun apiUrl(path: String): String = "https://$domain/api/v1/${path.removePrefix("/")}"
-
-    /**
-     * Plain GET against the JSON API (popular/latest/search/details). Matches the
-     * upstream Keiyoushi behaviour — these endpoints aren't request-signed. If the
-     * response isn't JSON it's almost certainly a Cloudflare interstitial, so we
-     * hand off to the in-app browser to clear it.
-     */
-    private suspend fun getApiJson(url: String): JSONObject {
-        val response = webClient.httpGet(url)
-        return runCatching { response.parseJson() }.getOrElse { e ->
-            requestCloudflareVerification(url, e)
-        }
-    }
-
     private suspend fun webViewApiJson(apiPath: String): JSONObject {
         return evaluateWebViewApiJson(
             pageUrl = "https://$domain/?kotatsu_comix_bridge=${System.currentTimeMillis()}",
@@ -486,10 +471,37 @@ internal class Comix(context: MangaLoaderContext) :
                         lower.includes('cf-chl-opt');
                 };
                 const findGlue = () => {
-                    let signer = null;
+                    const signers = [];
                     let installer = null;
                     let responseHandler = null;
                     const keys = Object.keys(window);
+                    const tryAsSigner = (fn) => {
+                        try {
+                            const out = fn(probePath);
+                            if (typeof out === "string" && out !== probePath && tokenRegex.test(out) && signers.indexOf(fn) === -1) {
+                                signers.push(fn);
+                            }
+                        } catch (e) {}
+                    };
+                    const tryAsInstaller = (fn) => {
+                        if (installer) return;
+                        try {
+                            let got = false;
+                            let resFn = null;
+                            const fakeAxios = {
+                                interceptors: {
+                                    request: { use: function() {} },
+                                    response: { use: function(fn) { got = true; resFn = fn; } }
+                                },
+                                defaults: { headers: { common: {} }, transformRequest: [], transformResponse: [] }
+                            };
+                            fn(fakeAxios);
+                            if (got) {
+                                installer = fn;
+                                responseHandler = resFn;
+                            }
+                        } catch (e) {}
+                    };
                     for (let i = 0; i < keys.length; i++) {
                         const topName = keys[i];
                         if (!/^vm[A-Za-z]_\w+${'$'}/.test(topName)) continue;
@@ -499,35 +511,25 @@ internal class Comix(context: MangaLoaderContext) :
                         for (let j = 0; j < fnames.length; j++) {
                             const fn = ns[fnames[j]];
                             if (typeof fn !== "function") continue;
-                            if (!signer) {
-                                try {
-                                    const out = fn(probePath);
-                                    if (typeof out === "string" && out !== probePath && tokenRegex.test(out)) {
-                                        signer = fn;
-                                    }
-                                } catch (e) {}
-                            }
-                            if (!installer) {
-                                try {
-                                    let got = false;
-                                    let resFn = null;
-                                    const fakeAxios = {
-                                        interceptors: {
-                                            request: { use: function() {} },
-                                            response: { use: function(fn) { got = true; resFn = fn; } }
-                                        },
-                                        defaults: { headers: { common: {} }, transformRequest: [], transformResponse: [] }
-                                    };
-                                    fn(fakeAxios);
-                                    if (got) {
-                                        installer = fn;
-                                        responseHandler = resFn;
-                                    }
-                                } catch (e) {}
-                            }
-                            if (signer && installer) return { signer, installer, responseHandler };
+                            tryAsSigner(fn);
+                            tryAsInstaller(fn);
                         }
                     }
+                    for (let i = 0; i < keys.length; i++) {
+                        const val = window[keys[i]];
+                        if (Array.isArray(val)) {
+                            for (let j = 0; j < val.length; j++) {
+                                if (typeof val[j] === "function") {
+                                    tryAsSigner(val[j]);
+                                    if (!installer) tryAsInstaller(val[j]);
+                                }
+                            }
+                        } else if (typeof val === "function" && keys[i].length <= 3) {
+                            tryAsSigner(val);
+                            if (!installer) tryAsInstaller(val);
+                        }
+                    }
+                    if (signers.length > 0 && installer) return { signers, installer, responseHandler };
                     return null;
                 };
 
@@ -570,22 +572,32 @@ internal class Comix(context: MangaLoaderContext) :
                         let text = "";
                         let signedUrl = "";
                         let lastError = "";
-                        const candidates = signCandidates(apiPath);
-                        for (const signablePath of candidates) {
-                            const sig = glue.signer(signablePath);
-                            if (!sig) {
-                                lastError = "signer returned empty token";
-                                continue;
+                        const pathCandidates = signCandidates(apiPath);
+                        for (const signer of glue.signers) {
+                            for (const signablePath of pathCandidates) {
+                                let sig = "";
+                                try {
+                                    sig = signer(signablePath);
+                                } catch (e) {
+                                    lastError = "signer failed for " + signablePath + ": " + String((e && e.message) || e);
+                                    continue;
+                                }
+                                if (!sig) {
+                                    lastError = "signer returned empty token";
+                                    continue;
+                                }
+                                signedUrl = apiPath + sep + "_=" + encodeURIComponent(sig);
+                                resp = await fetch(signedUrl, {
+                                    credentials: "include",
+                                    headers: { "Accept": "application/json", "X-Requested-With": "XMLHttpRequest" }
+                                });
+                                text = await resp.text();
+                                if (resp.status >= 200 && resp.status < 300) break;
+                                lastError = "HTTP " + resp.status + " signed=" + signablePath + ": " + text.slice(0, 200);
+                                if (resp.status !== 403 && resp.status !== 422) break;
                             }
-                            signedUrl = apiPath + sep + "_=" + encodeURIComponent(sig);
-                            resp = await fetch(signedUrl, {
-                                credentials: "include",
-                                headers: { "Accept": "application/json", "X-Requested-With": "XMLHttpRequest" }
-                            });
-                            text = await resp.text();
-                            if (resp.status >= 200 && resp.status < 300) break;
-                            lastError = "HTTP " + resp.status + " signed=" + signablePath + ": " + text.slice(0, 200);
-                            if (resp.status !== 422) break;
+                            if (resp && resp.status >= 200 && resp.status < 300) break;
+                            if (resp && resp.status !== 403 && resp.status !== 422) break;
                         }
                         if (!resp) throw new Error(lastError || "request was not sent");
                         if (resp.status < 200 || resp.status >= 300) {
@@ -700,9 +712,9 @@ internal class Comix(context: MangaLoaderContext) :
         if (cacheKey.isEmpty()) return null
         tagIdCache[cacheKey]?.let { return it.nullIfEmpty() }
         for (type in arrayOf("genre", "tag")) {
-            val url = apiUrl("tags/search?type=$type&q=${name.urlEncoded()}")
             val result = runCatching {
-                webClient.httpGet(url).parseJson().optJSONArray("result")
+                webViewApiJson("/api/v1/tags/search?type=$type&q=${name.urlEncoded()}")
+                    .optJSONArray("result")
             }.getOrNull()
             val id = result?.optJSONObject(0)?.optIntOrNull("id")?.toString()
             if (id != null) {

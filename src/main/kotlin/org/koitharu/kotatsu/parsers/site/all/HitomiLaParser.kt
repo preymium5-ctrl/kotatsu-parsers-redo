@@ -81,14 +81,33 @@ internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser
 		get() = MangaListFilterCapabilities(
 			isMultipleTagsSupported = true,
 			isSearchSupported = true,
+			isSearchWithFiltersSupported = true,
 		)
 
 	override suspend fun getFilterOptions() = MangaListFilterOptions(
 		availableTags = fetchAvailableTags(),
-		availableLocales = emptySet(),
+		availableLocales = localeMap.keys,
+		availableContentTypes = EnumSet.of(
+			ContentType.DOUJINSHI,
+			ContentType.MANGA,
+			ContentType.ARTIST_CG,
+			ContentType.GAME_CG,
+			ContentType.OTHER,
+		),
 	)
 
-	private fun Locale?.getSiteLang(): String = "english"
+	private fun Locale?.getSiteLang(): String {
+		return localeMap[this] ?: localeMap[Locale.forLanguageTag(this?.language.orEmpty())] ?: "english"
+	}
+
+	private fun mapType(type: ContentType): String = when (type) {
+		ContentType.DOUJINSHI -> "type:doujinshi"
+		ContentType.MANGA -> "type:manga"
+		ContentType.ARTIST_CG -> "type:artistcg"
+		ContentType.GAME_CG -> "type:gamecg"
+		ContentType.OTHER -> "type:anime"
+		else -> ""
+	}
 
 	private suspend fun fetchAvailableTags(): Set<MangaTag> = coroutineScope {
 		('a'..'z').map { alphabet ->
@@ -122,71 +141,35 @@ internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser
 
 	private var cachedSearchIds: List<Int> = emptyList()
 
-	override suspend fun getList(offset: Int, order: SortOrder, filter: MangaListFilter): List<Manga> = when {
-		filter.query.isNullOrEmpty() -> {
+	override suspend fun getList(offset: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
+		val typeQuery = filter.types.map { mapType(it) }.filter { it.isNotEmpty() }.joinToString(" ")
+		val tagsQuery = filter.tags.joinToString(" ") { it.key }
+		val searchQuery = filter.query.orEmpty().trim()
 
-			if (filter.tags.isEmpty()) {
-				when (order) {
-					SortOrder.POPULARITY_TODAY -> {
-						getGalleryIDsFromNozomi(
-							"popular",
-							"today",
-							filter.locale.getSiteLang(),
-							offset.nextOffsetRange(),
-						)
-					}
+		val fullQuery = listOf(searchQuery, tagsQuery, typeQuery)
+			.filter { it.isNotEmpty() }
+			.joinToString(" ")
 
-					SortOrder.POPULARITY_WEEK -> {
-						getGalleryIDsFromNozomi(
-							"popular",
-							"week",
-							filter.locale.getSiteLang(),
-							offset.nextOffsetRange(),
-						)
-					}
+		val language = filter.locale.getSiteLang()
 
-					SortOrder.POPULARITY_MONTH -> {
-						getGalleryIDsFromNozomi(
-							"popular",
-							"month",
-							filter.locale.getSiteLang(),
-							offset.nextOffsetRange(),
-						)
-					}
-
-					SortOrder.POPULARITY_YEAR -> {
-						getGalleryIDsFromNozomi(
-							"popular",
-							"year",
-							filter.locale.getSiteLang(),
-							offset.nextOffsetRange(),
-						)
-					}
-
-					else -> {
-						getGalleryIDsFromNozomi(null, "index", filter.locale.getSiteLang(), offset.nextOffsetRange())
-					}
-				}
-			} else {
-				if (offset == 0) {
-					cachedSearchIds =
-						hitomiSearch(
-							filter.tags.joinToString(" ") { it.key },
-							order,
-							filter.locale.getSiteLang(),
-						).toList()
-				}
-				cachedSearchIds.subList(offset, min(offset + 25, cachedSearchIds.size))
-			}
-		}
-
-		else -> {
+		if (fullQuery.isEmpty()) {
 			if (offset == 0) {
-				cachedSearchIds = hitomiSearch(filter.query, order).toList()
+				cachedSearchIds = when (order) {
+					SortOrder.POPULARITY_TODAY -> getGalleryIDsFromNozomi("popular", "today", language, offset.nextOffsetRange())
+					SortOrder.POPULARITY_WEEK -> getGalleryIDsFromNozomi("popular", "week", language, offset.nextOffsetRange())
+					SortOrder.POPULARITY_MONTH -> getGalleryIDsFromNozomi("popular", "month", language, offset.nextOffsetRange())
+					SortOrder.POPULARITY_YEAR -> getGalleryIDsFromNozomi("popular", "year", language, offset.nextOffsetRange())
+					else -> getGalleryIDsFromNozomi(null, "index", language, offset.nextOffsetRange())
+				}.toList()
 			}
-			cachedSearchIds.subList(offset, min(offset + 25, cachedSearchIds.size))
+			return cachedSearchIds.subList(offset, min(offset + 25, cachedSearchIds.size)).toMangaList()
+		} else {
+			if (offset == 0) {
+				cachedSearchIds = hitomiSearch(fullQuery, order, language).toList()
+			}
+			return cachedSearchIds.subList(offset, min(offset + 25, cachedSearchIds.size)).toMangaList()
 		}
-	}.toMangaList()
+	}
 
 	private fun Int.nextOffsetRange(): LongRange {
 		val bytes = this * 4L
