@@ -6,6 +6,7 @@ import okhttp3.Interceptor
 import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
+import org.jsoup.Jsoup
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.bitmap.Bitmap
@@ -99,6 +100,10 @@ internal class Comix(context: MangaLoaderContext) :
     }
 
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
+        if (page == 1 && filter.query.isNullOrEmpty() && filter.tags.isEmpty()) {
+            loadHomeManga()?.let { return it }
+        }
+
         val url = buildString {
             append(apiUrl("manga"))
             append("?")
@@ -158,6 +163,27 @@ internal class Comix(context: MangaLoaderContext) :
             val item = items.getJSONObject(i)
             parseMangaFromJson(item)
         }
+    }
+
+    private suspend fun loadHomeManga(): List<Manga>? {
+        val doc = runCatching { webClient.httpGet("https://$domain/").parseHtml() }.getOrElse { e ->
+            requestCloudflareVerification("https://$domain/", e)
+        }
+        val initialData = doc.getElementById("initial-data")?.data()?.ifBlank {
+            doc.getElementById("initial-data")?.html()?.let { Jsoup.parse(it).text() }
+        } ?: return null
+        val queries = runCatching { JSONObject(initialData).getJSONObject("queries") }.getOrNull() ?: return null
+        val result = LinkedHashMap<String, Manga>()
+        for (key in queries.keys()) {
+            if (!key.contains("\"manga\"") || !key.contains("\"top\"")) continue
+            val array = queries.optJSONArray(key) ?: continue
+            for (i in 0 until array.length()) {
+                val item = array.optJSONObject(i) ?: continue
+                val manga = parseMangaFromJson(item)
+                result.putIfAbsent(manga.url, manga)
+            }
+        }
+        return result.values.take(pageSize).takeIf { it.isNotEmpty() }
     }
 
     private fun parseMangaFromJson(json: JSONObject): Manga {
