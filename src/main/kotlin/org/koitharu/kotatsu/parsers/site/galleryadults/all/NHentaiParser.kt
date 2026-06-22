@@ -11,7 +11,7 @@ import org.koitharu.kotatsu.parsers.site.galleryadults.GalleryAdultsParser
 import org.koitharu.kotatsu.parsers.util.*
 import java.util.*
 
-@MangaSourceParser("NHENTAI", "NHentai.net", type = ContentType.HENTAI)
+@MangaSourceParser("NHENTAI", "NHentai.net", "en", ContentType.HENTAI)
 internal class NHentaiParser(context: MangaLoaderContext) :
 	GalleryAdultsParser(context, MangaParserSource.NHENTAI, "nhentai.net", 25) {
 	override val selectGallery = ""
@@ -65,7 +65,7 @@ internal class NHentaiParser(context: MangaLoaderContext) :
 	}
 
 	override suspend fun getFilterOptions() = MangaListFilterOptions(
-		availableLocales = setOf(Locale.ENGLISH, Locale.JAPANESE, Locale.CHINESE),
+		availableLocales = setOf(Locale.ENGLISH),
 		availableTags = mapTags()
 	)
 
@@ -103,7 +103,7 @@ internal class NHentaiParser(context: MangaLoaderContext) :
 					append("$apiUrl/galleries/$numericQuery")
 				} else {
 					append("$apiUrl/search?query=")
-					append(numericQuery.urlEncoded())
+					append(("$numericQuery english").urlEncoded())
 					append("&page=$page")
 				}
 			} else {
@@ -300,11 +300,10 @@ internal class NHentaiParser(context: MangaLoaderContext) :
 			joiner.append(tag.key)
 			joiner.append("\"")
 		}
-		language?.let { lc ->
-			joiner.add("language:\"")
-			joiner.append(lc.toLanguagePath())
-			joiner.append("\"")
-		}
+		val lc = language ?: Locale.ENGLISH
+		joiner.add("language:\"")
+		joiner.append(lc.toLanguagePath())
+		joiner.append("\"")
 		return joiner.complete()
 	}
 }

@@ -29,7 +29,7 @@ import java.util.Locale
 import kotlin.math.min
 
 @OptIn(ExperimentalUnsignedTypes::class)
-@MangaSourceParser("HITOMILA", "Hitomi.La", type = ContentType.HENTAI)
+@MangaSourceParser("HITOMILA", "Hitomi.La", "en", ContentType.HENTAI)
 internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser(context, MangaParserSource.HITOMILA) {
 	override val configKeyDomain = ConfigKey.Domain("hitomi.la")
 
@@ -85,13 +85,10 @@ internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser
 
 	override suspend fun getFilterOptions() = MangaListFilterOptions(
 		availableTags = fetchAvailableTags(),
-		availableLocales = localeMap.keys,
+		availableLocales = setOf(Locale.ENGLISH),
 	)
 
-	private fun Locale?.getSiteLang(): String = when (this) {
-		null -> "all"
-		else -> localeMap[this] ?: "all"
-	}
+	private fun Locale?.getSiteLang(): String = "english"
 
 	private suspend fun fetchAvailableTags(): Set<MangaTag> = coroutineScope {
 		('a'..'z').map { alphabet ->
@@ -199,7 +196,7 @@ internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser
 	private suspend fun hitomiSearch(
 		query: String,
 		sortByPopularity: SortOrder = SortOrder.UPDATED,
-		language: String = "all",
+		language: String = "english",
 	): Set<Int> =
 		coroutineScope {
 			val terms = query
@@ -275,7 +272,7 @@ internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser
 	// search.js
 	private suspend fun getGalleryIDsForQuery(
 		query: String,
-		language: String = "all",
+		language: String = "english",
 	): Set<Int> {
 		query.replace("_", " ").let {
 			if (it.indexOf(':') > -1) {

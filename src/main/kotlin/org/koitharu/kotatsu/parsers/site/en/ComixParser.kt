@@ -6,6 +6,7 @@ import okhttp3.Interceptor
 import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
+import org.jsoup.HttpStatusException
 import org.jsoup.Jsoup
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
@@ -104,8 +105,8 @@ internal class Comix(context: MangaLoaderContext) :
             loadHomeManga()?.let { return it }
         }
 
-        val url = buildString {
-            append(apiUrl("manga"))
+        val apiPath = buildString {
+            append("/api/v1/manga")
             append("?")
             var firstParam = true
             fun addParam(param: String) {
@@ -155,7 +156,6 @@ internal class Comix(context: MangaLoaderContext) :
             addParam("page=$page")
         }
 
-        val apiPath = "/api/v1/manga" + url.substringAfter("/api/v1/manga")
         val response = webViewApiJson(apiPath)
         val result = response.getJSONObject("result")
         val items = result.getJSONArray("items")
@@ -167,7 +167,38 @@ internal class Comix(context: MangaLoaderContext) :
     }
 
     private suspend fun loadHomeManga(): List<Manga>? {
-        val queries = loadInitialQueries("https://$domain/") ?: return null
+        val pageUrl = "https://$domain/"
+        val html = runCatching {
+            val request = okhttp3.Request.Builder()
+                .url(pageUrl)
+                .header("User-Agent", context.getDefaultUserAgent())
+                .build()
+            context.httpClient.newCall(request).await().use { response ->
+                val body = response.body?.string().orEmpty()
+                if (response.code == 503 || response.code == 502) {
+                    if (isMaintenancePage(body)) {
+                        throw ParseException("Comix is currently under maintenance. Please try again later.", pageUrl)
+                    }
+                }
+                if (!response.isSuccessful) {
+                    throw ParseException("HTTP error ${response.code}", pageUrl)
+                }
+                body
+            }
+        }.getOrElse { e ->
+            if (e is ParseException) throw e
+            requestCloudflareVerification(pageUrl, e)
+        }
+
+        if (isMaintenancePage(html)) {
+            throw ParseException("Comix is currently under maintenance. Please try again later.", pageUrl)
+        }
+
+        val doc = Jsoup.parse(html, pageUrl)
+        val initialData = doc.getElementById("initial-data")?.data()?.ifBlank {
+            doc.getElementById("initial-data")?.html()?.let { Jsoup.parse(it).text() }
+        } ?: return null
+        val queries = runCatching { JSONObject(initialData).getJSONObject("queries") }.getOrNull() ?: return null
         val result = LinkedHashMap<String, Manga>()
         for (key in queries.keys()) {
             if (!key.contains("\"manga\"") || !key.contains("\"top\"")) continue
@@ -202,11 +233,10 @@ internal class Comix(context: MangaLoaderContext) :
             else -> null
         }
 
-        val url = json.optString("url").nullIfEmpty() ?: "/title/$hashId"
         return Manga(
             id = generateUid(hashId),
-            url = url,
-            publicUrl = url.toAbsoluteUrl(domain),
+            url = "/title/$hashId",
+            publicUrl = "https://comix.to/title/$hashId",
             coverUrl = coverUrl,
             title = title,
             altTitles = emptySet(),
@@ -221,12 +251,21 @@ internal class Comix(context: MangaLoaderContext) :
     }
 
     override suspend fun getDetails(manga: Manga): Manga = coroutineScope {
-        val hashId = manga.url.toMangaHashId()
+        val hashId = manga.url.substringAfter("/title/")
         val chaptersDeferred = async { getChapters(manga) }
 
-        val updatedManga = loadMangaDetails(hashId, manga.publicUrl ?: manga.url.toAbsoluteUrl(domain))
+        val response = webViewApiJson("/api/v1/manga/$hashId")
 
-        return@coroutineScope (updatedManga ?: manga).copy(
+        if (response.has("result")) {
+            val result = response.getJSONObject("result")
+            val updatedManga = parseMangaFromJson(result)
+
+            return@coroutineScope updatedManga.copy(
+                chapters = chaptersDeferred.await(),
+            )
+        }
+
+        return@coroutineScope manga.copy(
             chapters = chaptersDeferred.await(),
         )
     }
@@ -322,8 +361,7 @@ internal class Comix(context: MangaLoaderContext) :
     }
 
     private suspend fun getChapters(manga: Manga): List<MangaChapter> {
-        val hashId = manga.url.toMangaHashId()
-        val mangaPath = manga.url.trimEnd('/')
+        val hashId = manga.url.substringAfter("/title/")
         val allChapters = loadAllChapters(hashId, manga.url.toAbsoluteUrl(domain))
         val chaptersBuilder = ChaptersListBuilder(allChapters.length())
         for (i in 0 until allChapters.length()) {
@@ -345,7 +383,7 @@ internal class Comix(context: MangaLoaderContext) :
                     title = title,
                     number = number,
                     volume = 0,
-                    url = "$mangaPath/$chapterId-chapter-${number.toChapterUrlPart()}",
+                    url = "/title/$hashId/$chapterId-chapter-${number.toChapterUrlPart()}",
                     uploadDate = parseRelativeDate(chapterData.optString("createdAtFormatted")),
                     source = source,
                     scanlator = scanlator,
@@ -358,146 +396,131 @@ internal class Comix(context: MangaLoaderContext) :
     }
 
     private suspend fun loadAllChapters(hashId: String, pageUrl: String): JSONArray {
-        val result = JSONArray()
-        val seen = HashSet<String>()
-        for (page in 1..200) {
-            val response = loadChaptersPage(hashId, pageUrl, page)
-            val root = response.optJSONObject("result") ?: response
-            val pageItems = root.optJSONArray("items") ?: JSONArray()
-            val pageKey = if (pageItems.length() > 0) {
-                "${pageItems.optJSONObject(0)?.optLong("id")}:${pageItems.optJSONObject(pageItems.length() - 1)?.optLong("id")}"
-            } else {
-                "empty:$page"
-            }
-            if (!seen.add(pageKey)) break
-            for (i in 0 until pageItems.length()) {
-                result.put(pageItems.get(i))
-            }
+        val apiPath = "/api/v1/manga/$hashId/chapters"
+        val response = evaluateWebViewApiJson(
+            pageUrl = pageUrl,
+            script = buildWebViewApiScript(
+                """
+                    const basePath = ${apiPath.toJsString()};
+                    const limit = 100;
+                    const items = [];
+                    const seen = new Set();
+                    for (let page = 1; page <= 200; page++) {
+                        const payload = await fetchProtected(basePath + "?limit=" + limit + "&page=" + page);
+                        const result = payload && payload.result ? payload.result : payload;
+                        const pageItems = Array.isArray(result && result.items) ? result.items : [];
+                        const meta = (result && (result.meta || result.pagination)) || {};
+                        const currentPage = Number((meta && (meta.page || meta.currentPage)) || page);
+                        const pageKey = pageItems.length > 0 ?
+                            String(pageItems[0].id) + ":" + String(pageItems[pageItems.length - 1].id) :
+                            "empty:" + page;
+                        if (seen.has(pageKey)) break;
+                        seen.add(pageKey);
+                        for (const item of pageItems) items.push(item);
 
-            val meta = root.optJSONObject("meta") ?: root.optJSONObject("pagination")
-            val currentPage = meta?.optInt("page", meta.optInt("currentPage", page)) ?: page
-            val lastPage = meta?.optInt("lastPage", 0)
-                ?: meta?.optInt("totalPages", 0)
-                ?: meta?.optInt("pages", 0)
-                ?: meta?.optInt("pageCount", 0)
-                ?: meta?.optInt("last_page", 0)
-                ?: meta?.optInt("total_pages", 0)
-                ?: 0
-            val hasNext = meta?.optBoolean("hasNext", false) == true
-            val hasNextFalse = meta?.has("hasNext") == true && !hasNext
-            if (pageItems.length() == 0 || hasNextFalse || lastPage > 0 && currentPage >= lastPage) break
-            if (!hasNext && pageItems.length() < CHAPTERS_PAGE_SIZE) break
-        }
-        return result
-    }
-
-    private suspend fun loadChaptersPage(hashId: String, pageUrl: String, page: Int): JSONObject {
-        val apiPath = "/api/v1/manga/$hashId/chapters?limit=$CHAPTERS_PAGE_SIZE&page=$page"
-        return webViewApiJson(apiPath)
-    }
-
-    private suspend fun loadMangaDetails(hashId: String, pageUrl: String): Manga? {
-        val queries = loadInitialQueries(pageUrl) ?: return null
-        for (key in queries.keys()) {
-            if (!key.contains("\"manga\"") || !key.contains("\"detail\"") || !key.contains("\"$hashId\"")) continue
-            val item = queries.optJSONObject(key) ?: continue
-            return parseMangaFromJson(item)
-        }
-        return null
-    }
-
-    // The HTML pages (home, title, chapter) are served without a request token
-    // and carry everything the parser needs for list/details in a
-    // `<script id="initial-data">` JSON blob. Plain HTTP is both faster and far
-    // more robust than the signed-API WebView bridge, so prefer it here. Only
-    // the chapter list and chapter pages (which aren't embedded in the HTML)
-    // fall back to the bridge.
-    private suspend fun loadInitialQueries(pageUrl: String): JSONObject? {
-        val doc = runCatching { webClient.httpGet(pageUrl).parseHtml() }.getOrElse { e ->
-            requestCloudflareVerification(pageUrl, e)
-        }
-        val scriptEl = doc.getElementById("initial-data") ?: return null
-        // `.data()` is the text content of a `<script>` element; fall back to
-        // the raw inner HTML (tag-stripped) for any encoding edge case.
-        val initialData = scriptEl.data().ifBlank {
-            scriptEl.html().let { Jsoup.parse(it).text() }
-        }.ifBlank { return null }
-        return runCatching { JSONObject(initialData).getJSONObject("queries") }.getOrNull()
-    }
-
-    private fun apiUrl(path: String): String = "https://$domain/api/v1/${path.removePrefix("/")}"
-
-    // The signed-API bridge. The site gates `/api/v1/*` behind a per-request
-    // token in the `_=` query param, generated by obfuscated client-side code.
-    // The stable piece is the site's own API wrapper in the `env-*` module; it
-    // installs the current request signer/decryptor on its axios instance. We
-    // import that module inside the page and let it perform the request, then
-    // send the JSON result back through a captured navigation.
-    private suspend fun webViewApiJson(apiPath: String): JSONObject {
-        val pageUrl = "https://$domain/?kotatsu_comix_bridge=${System.currentTimeMillis()}"
-        val script = buildWebViewApiScript(apiPath)
-        val config = InterceptionConfig(
-            timeoutMs = WEBVIEW_API_TIMEOUT,
-            maxRequests = 1,
-            urlPattern = INTERCEPT_URL_REGEX,
-            pageScript = buildBridgeWrapper(script),
+                        const hasNext = meta && (meta.hasNext === true || meta.hasNext === "true" ||
+                            meta.hasNext === 1 || meta.hasNext === "1");
+                        const hasNextFalse = meta && (meta.hasNext === false || meta.hasNext === "false" ||
+                            meta.hasNext === 0 || meta.hasNext === "0");
+                        const lastPage = Number(meta && (meta.lastPage || meta.totalPages || meta.pages ||
+                            meta.pageCount || meta.last_page || meta.total_pages));
+                        if (pageItems.length === 0 || hasNextFalse || (lastPage && currentPage >= lastPage)) {
+                            break;
+                        }
+                        if (!hasNext && pageItems.length < limit) {
+                            break;
+                        }
+                    }
+                    return JSON.stringify({ items: items });
+                """.trimIndent(),
+            ),
         )
+        return response.optJSONArray("items") ?: JSONArray()
+    }
+
+    private suspend fun webViewApiJson(apiPath: String): JSONObject {
+        return evaluateWebViewApiJson(
+            pageUrl = "https://$domain/?kotatsu_comix_bridge=${System.currentTimeMillis()}",
+            script = buildWebViewApiScript("return JSON.stringify(await fetchProtected(${apiPath.toJsString()}));"),
+        )
+    }
+
+    private suspend fun evaluateWebViewApiJson(pageUrl: String, script: String): JSONObject {
+        val bridgeScript = buildWebViewApiBridgeScript(script)
         val requests = runCatching {
-            context.interceptWebViewRequests(pageUrl, config)
+            context.interceptWebViewRequests(
+                pageUrl,
+                InterceptionConfig(
+                    timeoutMs = WEBVIEW_API_TIMEOUT,
+                    maxRequests = 1,
+                    urlPattern = INTERCEPT_URL_REGEX,
+                    pageScript = bridgeScript,
+                ),
+            )
         }.getOrElse { e ->
             throw ParseException("Comix WebView API interception failed", pageUrl, e)
         }
         val resultUrl = requests.firstOrNull()?.url
             ?: throw ParseException("Comix WebView API did not return a bridge result", pageUrl)
-        when {
+        val decoded = when {
             resultUrl.contains("/error", ignoreCase = true) -> {
                 val message = resultUrl.queryParameterValue("msg") ?: "unknown WebView error"
+                if (message.contains("maintenance", ignoreCase = true) || message.contains("maintaining the site", ignoreCase = true)) {
+                    throw ParseException("Comix is currently under maintenance. Please try again later.", pageUrl)
+                }
                 throw ParseException("Comix WebView API failed: $message", pageUrl)
             }
-            resultUrl.contains("/cf", ignoreCase = true) -> requestCloudflareVerification(pageUrl)
+            else -> resultUrl.queryParameterValue("data")
+                ?: throw ParseException("Comix WebView API bridge result missing data", pageUrl)
         }
-        val signedUrl = resultUrl.queryParameterValue("data")
-            ?: throw ParseException("Comix WebView API bridge result missing data", pageUrl)
-        if (signedUrl == CLOUDFLARE_BLOCKED || isCloudflarePage(signedUrl)) {
+        if (isMaintenancePage(decoded)) {
+            throw ParseException("Comix is currently under maintenance. Please try again later.", pageUrl)
+        }
+        if (decoded == CLOUDFLARE_BLOCKED || isCloudflarePage(decoded)) {
             requestCloudflareVerification(pageUrl)
         }
-        if (signedUrl.isBlank()) {
+        if (decoded.isBlank()) {
             throw ParseException("Comix WebView API returned an empty response", pageUrl)
         }
-        val json = runCatching { JSONObject(signedUrl) }.getOrElse { e ->
-            throw ParseException("Comix WebView API returned invalid JSON: ${signedUrl.take(200)}", pageUrl, e)
+        val json = runCatching { JSONObject(decoded) }.getOrElse { e ->
+            throw ParseException("Comix WebView API returned invalid JSON: ${decoded.take(200)}", pageUrl, e)
         }
         json.optString("error").nullIfEmpty()?.let { error ->
+            if (error.contains("maintenance", ignoreCase = true) || error.contains("maintaining the site", ignoreCase = true)) {
+                throw ParseException("Comix is currently under maintenance. Please try again later.", pageUrl)
+            }
             throw ParseException("Comix WebView API failed: $error", pageUrl)
         }
         return json
     }
 
-    // Wraps a page script so its resolved value (or thrown error) is funnelled
-    // back to Kotlin through a navigation the interceptor captures. Mirrors the
-    // pattern used by Kagane et al.
-    private fun buildBridgeWrapper(script: String): String {
+    private fun buildWebViewApiBridgeScript(script: String): String {
         return """
             (async function() {
                 try {
                     const result = await $script;
-                    window.location.href = "$INTERCEPT_RESULT_URL?data=" + encodeURIComponent(String(result || ""));
+                    window.location.href = "$INTERCEPT_RESULT_URL#data=" + encodeURIComponent(String(result || ""));
                 } catch (e) {
-                    window.location.href = "$INTERCEPT_ERROR_URL?msg=" + encodeURIComponent(String((e && e.message) || e));
+                    window.location.href = "$INTERCEPT_ERROR_URL#msg=" + encodeURIComponent(String((e && e.message) || e));
                 }
             })();
         """.trimIndent()
     }
 
-    private fun buildWebViewApiScript(apiPath: String): String {
+    private fun buildWebViewApiScript(body: String): String {
         return """
             (async () => {
-                const wantPath = ${apiPath.toJsString()};
+                const probePath = "/manga/g2rk/chapters";
+                const tokenRegex = /^[A-Za-z0-9_-]{20,200}$/;
+                const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
                 const challengeDetected = () => {
                     const root = document.documentElement;
                     const html = (root && root.outerHTML) || "";
                     const text = ((document.body && document.body.innerText) || (root && root.innerText) || "");
                     const lower = (document.title + "\n" + text + "\n" + html).toLowerCase();
+                    if (lower.includes("we're maintaining the site") || lower.includes("maintenance")) {
+                        throw new Error("Comix is currently under maintenance. Please try again later.");
+                    }
                     return document.querySelector('script[src*="challenge-platform"]') !== null ||
                         document.querySelector('script[src*="turnstile"]') !== null ||
                         document.querySelector('iframe[src*="challenges.cloudflare.com"]') !== null ||
@@ -511,83 +534,163 @@ internal class Comix(context: MangaLoaderContext) :
                         lower.includes('turnstile') ||
                         lower.includes('cf-chl-opt');
                 };
-                if (challengeDetected()) return "$CLOUDFLARE_BLOCKED";
-
-                const findEnvModuleUrl = async () => {
-                    const scripts = Array.from(document.querySelectorAll('script[type="module"][src]'));
-                    for (const script of scripts) {
+                const findGlue = () => {
+                    const signers = [];
+                    let installer = null;
+                    let responseHandler = null;
+                    const keys = Object.keys(window);
+                    const tryAsSigner = (fn) => {
                         try {
-                            const mainUrl = new URL(script.src, location.href);
-                            const js = await fetch(mainUrl.href, { credentials: "same-origin" }).then(r => r.text());
-                            const match = js.match(/from\s*["']\.\/(env-[^"']+\.js)["']/);
-                            if (match) return new URL(match[1], mainUrl).href;
+                            const out = fn(probePath);
+                            if (typeof out === "string" && out !== probePath && tokenRegex.test(out) && signers.indexOf(fn) === -1) {
+                                signers.push(fn);
+                            }
                         } catch (e) {}
+                    };
+                    const tryAsInstaller = (fn) => {
+                        if (installer) return;
+                        try {
+                            let got = false;
+                            let resFn = null;
+                            const fakeAxios = {
+                                interceptors: {
+                                    request: { use: function() {} },
+                                    response: { use: function(fn) { got = true; resFn = fn; } }
+                                },
+                                defaults: { headers: { common: {} }, transformRequest: [], transformResponse: [] }
+                            };
+                            fn(fakeAxios);
+                            if (got) {
+                                installer = fn;
+                                responseHandler = resFn;
+                            }
+                        } catch (e) {}
+                    };
+                    for (let i = 0; i < keys.length; i++) {
+                        const topName = keys[i];
+                        if (!/^vm[A-Za-z]_\w+${'$'}/.test(topName)) continue;
+                        const ns = window[topName];
+                        if (!ns || typeof ns !== "object") continue;
+                        const fnames = Object.keys(ns);
+                        for (let j = 0; j < fnames.length; j++) {
+                            const fn = ns[fnames[j]];
+                            if (typeof fn !== "function") continue;
+                            tryAsSigner(fn);
+                            tryAsInstaller(fn);
+                        }
                     }
-                    const links = Array.from(document.querySelectorAll('link[href*="/dist/env-"][href$=".js"]'));
-                    for (const link of links) {
-                        try { return new URL(link.href, location.href).href; } catch (e) {}
+                    for (let i = 0; i < keys.length; i++) {
+                        const val = window[keys[i]];
+                        if (Array.isArray(val)) {
+                            for (let j = 0; j < val.length; j++) {
+                                if (typeof val[j] === "function") {
+                                    tryAsSigner(val[j]);
+                                    if (!installer) tryAsInstaller(val[j]);
+                                }
+                            }
+                        } else if (typeof val === "function" && keys[i].length <= 3) {
+                            tryAsSigner(val);
+                            if (!installer) tryAsInstaller(val);
+                        }
                     }
-                    throw new Error("Comix env module not found");
+                    if (signers.length > 0 && installer) return { signers, installer, responseHandler };
+                    return null;
                 };
 
-                const env = await import(await findEnvModuleUrl());
-                const api = env.b;
-                if (!api || typeof api.get !== "function") {
-                    throw new Error("Comix API client not available");
-                }
-                const pick = (obj, keys) => {
-                    if (!obj || typeof obj !== "object") return obj;
-                    const out = {};
-                    for (const key of keys) {
-                        if (Object.prototype.hasOwnProperty.call(obj, key)) out[key] = obj[key];
+                try {
+                    let glue = null;
+                    for (let attempt = 0; attempt < 80; attempt++) {
+                        if (challengeDetected()) {
+                            return "$CLOUDFLARE_BLOCKED";
+                        }
+                        glue = findGlue();
+                        if (glue) break;
+                        await sleep(250);
                     }
-                    return out;
-                };
-                const slimTerm = (item) => pick(item, ["id", "title", "name", "slug"]);
-                const slimTerms = (items) => Array.isArray(items) ? items.map(slimTerm) : items;
-                const slimManga = (item) => {
-                    const out = pick(item, [
-                        "id", "hid", "hash_id", "title", "synopsis", "poster", "status",
-                        "ratedAvg", "rated_avg", "url", "contentRating",
-                    ]);
-                    for (const key of ["genres", "genre", "tags", "theme", "demographics", "demographic", "formats"]) {
-                        if (Array.isArray(item && item[key])) out[key] = slimTerms(item[key]);
-                    }
-                    if (Array.isArray(item && item.authors)) out.authors = slimTerms(item.authors);
-                    if (Array.isArray(item && item.author)) out.author = slimTerms(item.author);
-                    return out;
-                };
-                const slimChapter = (item) => {
-                    const out = pick(item, [
-                        "id", "number", "name", "isOfficial", "createdAtFormatted",
-                        "group", "scanlation_group",
-                    ]);
-                    if (out.group) out.group = pick(out.group, ["name"]);
-                    if (out.scanlation_group) out.scanlation_group = pick(out.scanlation_group, ["name"]);
-                    return out;
-                };
-                const slimPage = (item) => pick(item, ["url", "s", "width", "height"]);
-                const slimResult = (data) => {
-                    if (Array.isArray(data)) return data.map(slimTerm);
-                    if (!data || typeof data !== "object") return data;
-                    if (data.pages) {
-                        const pages = Array.isArray(data.pages) ? data.pages.map(slimPage) : {
-                            baseUrl: data.pages.baseUrl,
-                            items: Array.isArray(data.pages.items) ? data.pages.items.map(slimPage) : data.pages.items,
+                    if (!glue) throw new Error("signer/decryptor not detected");
+
+                    const captured = { res: glue.responseHandler || null };
+                    if (!captured.res) {
+                        const fakeAxios = {
+                            interceptors: {
+                                request: { use: function() {} },
+                                response: { use: function(fn) { captured.res = fn; } }
+                            },
+                            defaults: { headers: { common: {} }, transformRequest: [], transformResponse: [] }
                         };
-                        return { pages };
+                        glue.installer(fakeAxios);
                     }
-                    if (Array.isArray(data.items)) {
-                        const first = data.items[0] || {};
-                        const mapper = "number" in first ? slimChapter : slimManga;
-                        return { ...pick(data, ["meta", "pagination"]), items: data.items.map(mapper) };
-                    }
-                    return data;
-                };
-                const url = new URL(wantPath, location.origin);
-                const path = url.pathname.replace(/^\/api\/v1/, "") || "/";
-                const data = await api.get(path + url.search);
-                return JSON.stringify({ result: slimResult(data) });
+
+                    const signCandidates = (apiPath) => {
+                        const withoutApi = apiPath.replace(/^\/api\/v1/, "");
+                        const withoutQuery = withoutApi.split("?")[0];
+                        const decoded = (() => {
+                            try { return decodeURIComponent(withoutApi); } catch (e) { return withoutApi; }
+                        })();
+                        return [...new Set([withoutApi, decoded, withoutQuery])];
+                    };
+
+                    const fetchProtected = async (apiPath) => {
+                        const sep = apiPath.indexOf("?") === -1 ? "?" : "&";
+                        let resp = null;
+                        let text = "";
+                        let signedUrl = "";
+                        let lastError = "";
+                        const pathCandidates = signCandidates(apiPath);
+                        for (const signer of glue.signers) {
+                            for (const signablePath of pathCandidates) {
+                                let sig = "";
+                                try {
+                                    sig = signer(signablePath);
+                                } catch (e) {
+                                    lastError = "signer failed for " + signablePath + ": " + String((e && e.message) || e);
+                                    continue;
+                                }
+                                if (!sig) {
+                                    lastError = "signer returned empty token";
+                                    continue;
+                                }
+                                signedUrl = apiPath + sep + "_=" + encodeURIComponent(sig);
+                                resp = await fetch(signedUrl, {
+                                    credentials: "include",
+                                    headers: { "Accept": "application/json", "X-Requested-With": "XMLHttpRequest" }
+                                });
+                                text = await resp.text();
+                                if (resp.status >= 200 && resp.status < 300) break;
+                                lastError = "HTTP " + resp.status + " signed=" + signablePath + ": " + text.slice(0, 200);
+                                if (resp.status !== 403 && resp.status !== 422) break;
+                            }
+                            if (resp && resp.status >= 200 && resp.status < 300) break;
+                            if (resp && resp.status !== 403 && resp.status !== 422) break;
+                        }
+                        if (!resp) throw new Error(lastError || "request was not sent");
+                        if (resp.status < 200 || resp.status >= 300) {
+                            throw new Error(lastError || ("HTTP " + resp.status + ": " + text.slice(0, 200)));
+                        }
+                        const raw = JSON.parse(text);
+                        if (raw && typeof raw === "object" && "e" in raw && captured.res) {
+                            const fakeResp = {
+                                data: raw,
+                                status: resp.status,
+                                statusText: resp.statusText,
+                                headers: Object.fromEntries([...resp.headers.entries()]),
+                                config: { url: signedUrl, method: "get", baseURL: "/api/v1" },
+                                request: {}
+                            };
+                            const decoded = await captured.res(fakeResp);
+                            return { result: decoded && decoded.data };
+                        }
+                        if (raw && typeof raw === "object" && "e" in raw) {
+                            throw new Error("encrypted response received but decryptor was not captured");
+                        }
+                        if (raw && typeof raw === "object" && "result" in raw) return raw;
+                        return { result: raw };
+                    };
+
+                    $body
+                } catch (e) {
+                    return JSON.stringify({ error: String((e && e.message) || e) });
+                }
             })();
         """.trimIndent()
     }
@@ -619,10 +722,6 @@ internal class Comix(context: MangaLoaderContext) :
             .replace("\t", "\\t") + "\""
     }
 
-    private fun String.toMangaHashId(): String {
-        return substringAfter("/title/").substringBefore('-').substringBefore('/')
-    }
-
     private fun isCloudflarePage(html: String): Boolean {
         if (html.isBlank()) return false
         val lower = html.lowercase(Locale.US)
@@ -635,6 +734,12 @@ internal class Comix(context: MangaLoaderContext) :
             lower.contains("cf-turnstile") ||
             lower.contains("turnstile") ||
             lower.contains("we're maintaining the site")
+    }
+
+    private fun isMaintenancePage(html: String): Boolean {
+        if (html.isBlank()) return false
+        val lower = html.lowercase(Locale.US)
+        return lower.contains("we're maintaining the site") || lower.contains("<title>maintenance</title>")
     }
 
     private fun parseTerms(json: JSONObject): Set<MangaTag> {
@@ -677,9 +782,9 @@ internal class Comix(context: MangaLoaderContext) :
         if (cacheKey.isEmpty()) return null
         tagIdCache[cacheKey]?.let { return it.nullIfEmpty() }
         for (type in arrayOf("genre", "tag")) {
-            val apiPath = "/api/v1/tags/search?type=$type&q=${name.urlEncoded()}"
             val result = runCatching {
-                webViewApiJson(apiPath).optJSONArray("result")
+                webViewApiJson("/api/v1/tags/search?type=$type&q=${name.urlEncoded()}")
+                    .optJSONArray("result")
             }.getOrNull()
             val id = result?.optJSONObject(0)?.optIntOrNull("id")?.toString()
             if (id != null) {
@@ -736,7 +841,6 @@ internal class Comix(context: MangaLoaderContext) :
         private const val GRID_COLS = 5
         private const val GRID_ROWS = 5
         private const val NUM_TILES = GRID_COLS * GRID_ROWS
-        private const val CHAPTERS_PAGE_SIZE = 50
         private const val LCG_MULTIPLIER = 1664525
         private const val LCG_INCREMENT = 1013904223
         private val RELATIVE_DATE_REGEX = Regex("""^(\d+)\s*(s|m|h|d|w|mo|mos|y|yr|yrs|min|mins|sec|secs|hr|hrs|day|days|week|weeks|month|months|year|years)$""")

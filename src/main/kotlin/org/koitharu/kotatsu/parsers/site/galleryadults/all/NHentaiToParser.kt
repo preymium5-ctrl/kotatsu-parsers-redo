@@ -10,7 +10,7 @@ import org.koitharu.kotatsu.parsers.site.galleryadults.GalleryAdultsParser
 import org.koitharu.kotatsu.parsers.util.*
 import java.util.*
 
-@MangaSourceParser("NHENTAI_TO", "NHentai.to", type = ContentType.HENTAI)
+@MangaSourceParser("NHENTAI_TO", "NHentai.to", "en", ContentType.HENTAI)
 internal class NHentaiToParser(context: MangaLoaderContext) :
 	GalleryAdultsParser(context, MangaParserSource.NHENTAI_TO, "nhentai.to", 25) {
 	override val selectGallery = "div.index-container:not(.index-popular) .gallery, #related-container .gallery"
@@ -34,37 +34,28 @@ internal class NHentaiToParser(context: MangaLoaderContext) :
 		)
 
 	override suspend fun getFilterOptions() = super.getFilterOptions().copy(
-		availableLocales = setOf(Locale.ENGLISH, Locale.JAPANESE, Locale.CHINESE),
+		availableLocales = setOf(Locale.ENGLISH),
 	)
 
 	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
 		val url = buildString {
 			append("https://")
 			append(domain)
+			val q = filter.query
+			val tag = filter.tags.oneOrThrowIfMany()
 			when {
-				filter.tags.isEmpty() && filter.locale == null -> {
+				!q.isNullOrEmpty() -> {
 					append("/search/?q=")
-					append(if (filter.query.isNullOrEmpty()) "" else filter.query.urlEncoded())
+					append(("$q language:english").urlEncoded())
 					append("&")
 				}
-
+				tag != null -> {
+					append("/search/?q=")
+					append(("tag:\"${tag.key}\" language:english").urlEncoded())
+					append("&")
+				}
 				else -> {
-					val tag = filter.tags.oneOrThrowIfMany()
-					val lang = filter.locale
-					if (tag != null && lang != null) {
-						throw IllegalArgumentException(ErrorMessages.FILTER_BOTH_LOCALE_GENRES_NOT_SUPPORTED)
-					}
-					if (tag != null) {
-						append("/tag/")
-						append(tag.key)
-						append("/?")
-					} else if (filter.locale != null) {
-						append("/language/")
-						append(filter.locale.toLanguagePath())
-						append("/?")
-					} else {
-						append("/?")
-					}
+					append("/language/english/?")
 				}
 			}
 			append("page=")

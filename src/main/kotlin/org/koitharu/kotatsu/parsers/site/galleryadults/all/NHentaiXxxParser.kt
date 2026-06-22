@@ -11,7 +11,7 @@ import org.koitharu.kotatsu.parsers.site.galleryadults.GalleryAdultsParser
 import org.koitharu.kotatsu.parsers.util.*
 import java.util.*
 
-@MangaSourceParser("NHENTAI_XXX", "NHentai.xxx", type = ContentType.HENTAI)
+@MangaSourceParser("NHENTAI_XXX", "NHentai.xxx", "en", ContentType.HENTAI)
 internal class NHentaiXxxParser(context: MangaLoaderContext) :
 	GalleryAdultsParser(context, MangaParserSource.NHENTAI_XXX, "nhentai.xxx", 25) {
 
@@ -40,7 +40,7 @@ internal class NHentaiXxxParser(context: MangaLoaderContext) :
 		)
 
 	override suspend fun getFilterOptions() = super.getFilterOptions().copy(
-		availableLocales = setOf(Locale.ENGLISH, Locale.JAPANESE, Locale.CHINESE),
+		availableLocales = setOf(Locale.ENGLISH),
 	)
 
 	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
@@ -49,16 +49,9 @@ internal class NHentaiXxxParser(context: MangaLoaderContext) :
 			append(domain)
 
 			val tags = filter.tags
-			val lang = filter.locale
-			if (tags.isNotEmpty() && lang != null) {
-				throw IllegalArgumentException(ErrorMessages.FILTER_BOTH_LOCALE_GENRES_NOT_SUPPORTED)
-			}
-
 			when {
-				lang != null -> {
-					append("/language/")
-					append(lang.toLanguagePath())
-					append("/?")
+				tags.isEmpty() && filter.query.isNullOrEmpty() -> {
+					append("/language/english/?")
 				}
 
 				else -> {
@@ -72,6 +65,7 @@ internal class NHentaiXxxParser(context: MangaLoaderContext) :
 					if (!filter.query.isNullOrEmpty()) {
 						joiner.add(filter.query.urlEncoded())
 					}
+					joiner.add("english")
 					append(joiner.complete())
 				}
 			}

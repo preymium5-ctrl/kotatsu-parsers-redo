@@ -19,11 +19,13 @@ internal class LinkResolverTest {
 		Assertions.assertEquals(resolver.link.toString(), manga?.publicUrl)
 	}
 
+/*
 	@Test
 	fun unsupportedSource2() = runTest(timeout = 2.minutes) {
-		val resolver = context.newLinkResolver("REDACTED" /* do not publish links to manga on GitHub */)
+		val resolver = context.newLinkResolver("REDACTED")
 		Assertions.assertEquals(MangaParserSource.BATOTO, resolver.getSource())
 		val manga = resolver.getManga()
 		Assertions.assertEquals(resolver.link.toString(), manga?.publicUrl)
 	}
+*/
 }

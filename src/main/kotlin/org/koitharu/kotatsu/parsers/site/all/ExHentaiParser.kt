@@ -29,7 +29,7 @@ private const val DOMAIN_AUTHORIZED = "exhentai.org"
 private val TAG_PREFIXES = arrayOf("male:", "female:", "other:")
 private const val BANNED_RESPONSE_LENGTH = 256L
 
-@MangaSourceParser("EXHENTAI", "ExHentai", type = ContentType.HENTAI)
+@MangaSourceParser("EXHENTAI", "ExHentai", "en", ContentType.HENTAI)
 internal class ExHentaiParser(
     context: MangaLoaderContext,
 ) : PagedMangaParser(context, MangaParserSource.EXHENTAI, pageSize = 25), MangaParserAuthProvider, Interceptor {
@@ -85,21 +85,7 @@ internal class ExHentaiParser(
             ContentType.OTHER,
         ),
         availableLocales = setOf(
-            Locale.JAPANESE,
             Locale.ENGLISH,
-            Locale.CHINESE,
-            Locale("nl"),
-            Locale.FRENCH,
-            Locale.GERMAN,
-            Locale("hu"),
-            Locale.ITALIAN,
-            Locale("kr"),
-            Locale("pl"),
-            Locale("pt"),
-            Locale("ru"),
-            Locale("es"),
-            Locale("th"),
-            Locale("vi"),
         ),
     )
 
@@ -430,9 +416,6 @@ internal class ExHentaiParser(
     }
 
     private fun MangaListFilter.toSearchQuery(): String? {
-        if (isEmpty()) {
-            return null
-        }
         val joiner = StringUtil.StringJoiner(" ")
         if (!query.isNullOrEmpty()) {
             joiner.add(query)
@@ -453,11 +436,7 @@ internal class ExHentaiParser(
             joiner.append(tag.key)
             joiner.append("\"$")
         }
-        locale?.let { lc ->
-            joiner.add("language:\"")
-            joiner.append(lc.toLanguagePath())
-            joiner.append("\"$")
-        }
+        joiner.add("language:\"english\"$")
         if (!author.isNullOrEmpty()) {
             joiner.add("artist:\"")
             joiner.append(author)

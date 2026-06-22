@@ -3,15 +3,12 @@ package org.koitharu.kotatsu.parsers.site.galleryadults.all
 import org.jsoup.nodes.Element
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
-import org.koitharu.kotatsu.parsers.model.ContentType
-import org.koitharu.kotatsu.parsers.model.MangaParserSource
-import org.koitharu.kotatsu.parsers.model.MangaTag
+import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.site.galleryadults.GalleryAdultsParser
-import org.koitharu.kotatsu.parsers.util.mapToSet
-import org.koitharu.kotatsu.parsers.util.removeSuffix
+import org.koitharu.kotatsu.parsers.util.*
 import java.util.*
 
-@MangaSourceParser("ASMHENTAI", "AsmHentai", type = ContentType.HENTAI)
+@MangaSourceParser("ASMHENTAI", "AsmHentai", "en", ContentType.HENTAI)
 internal class AsmHentai(context: MangaLoaderContext) :
 	GalleryAdultsParser(context, MangaParserSource.ASMHENTAI, "asmhentai.com") {
 
@@ -26,11 +23,27 @@ internal class AsmHentai(context: MangaLoaderContext) :
 	override suspend fun getFilterOptions() = super.getFilterOptions().copy(
 		availableLocales = setOf(
 			Locale.ENGLISH,
-			Locale.JAPANESE,
-			Locale.CHINESE,
-			Locale("tr"),
 		),
 	)
+
+	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
+		val tag = filter.tags.oneOrThrowIfMany()
+		val englishFilter = when {
+			!filter.query.isNullOrEmpty() -> filter.copy(
+				query = "${filter.query} english",
+				locale = null
+			)
+			tag != null -> filter.copy(
+				query = "${tag.title} english",
+				tags = emptySet(),
+				locale = null
+			)
+			else -> filter.copy(
+				locale = Locale.ENGLISH
+			)
+		}
+		return super.getListPage(page, order, englishFilter)
+	}
 
 	override fun Element.parseTags() = select("a").mapToSet {
 		val key = it.attr("href").removeSuffix('/').substringAfterLast('/')
