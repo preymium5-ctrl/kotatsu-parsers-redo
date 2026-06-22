@@ -514,25 +514,21 @@ internal class Comix(context: MangaLoaderContext) :
                 const tokenRegex = /^[A-Za-z0-9_-]{20,200}$/;
                 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
                 const challengeDetected = () => {
-                    const root = document.documentElement;
-                    const html = (root && root.outerHTML) || "";
-                    const text = ((document.body && document.body.innerText) || (root && root.innerText) || "");
-                    const lower = (document.title + "\n" + text + "\n" + html).toLowerCase();
-                    if (lower.includes("we're maintaining the site") || lower.includes("maintenance")) {
+                    const title = (document.title || '').toLowerCase();
+                    const text = ((document.body && document.body.innerText) || '').toLowerCase();
+                    if (title.includes("maintenance") || text.includes("we're maintaining the site")) {
                         throw new Error("Comix is currently under maintenance. Please try again later.");
                     }
-                    return document.querySelector('script[src*="challenge-platform"]') !== null ||
-                        document.querySelector('script[src*="turnstile"]') !== null ||
-                        document.querySelector('iframe[src*="challenges.cloudflare.com"]') !== null ||
-                        document.querySelector('.cf-turnstile') !== null ||
-                        document.querySelector('form[action*="__cf_chl"]') !== null ||
+                    return title.includes('just a moment') ||
+                        title.includes('attention required') ||
+                        title.includes('checking your browser') ||
+                        title.includes('one more step') ||
+                        document.querySelector('#cf-challenge-running') !== null ||
+                        document.querySelector('#challenge-stage') !== null ||
                         document.querySelector('.cf-browser-verification') !== null ||
-                        ((lower.includes('just a moment') || lower.includes('checking your browser')) && lower.includes('cloudflare')) ||
-                        lower.includes('challenge-platform') ||
-                        lower.includes('challenges.cloudflare.com') ||
-                        lower.includes('cf-turnstile') ||
-                        lower.includes('turnstile') ||
-                        lower.includes('cf-chl-opt');
+                        document.querySelector('form[action*="__cf_chl"]') !== null ||
+                        document.querySelector('.cf-turnstile') !== null ||
+                        document.querySelector('iframe[src*="challenges.cloudflare.com"]') !== null;
                 };
                 const findGlue = () => {
                     const signers = [];
