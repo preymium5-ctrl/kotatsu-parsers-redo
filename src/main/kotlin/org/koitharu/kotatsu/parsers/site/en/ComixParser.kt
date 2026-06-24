@@ -536,13 +536,18 @@ internal class Comix(context: MangaLoaderContext) :
             } else {
                 "Chapter $number"
             }
+            // Prefer the canonical path the API provides — it carries the full
+            // title slug (e.g. `/title/x0ynk-villains.../<id>-chapter-N`). The
+            // hashId-only path 404s in the reader.
+            val chapterUrl = chapterData.optString("url").nullIfEmpty()
+                ?: "/title/$hashId/$chapterId-chapter-${number.toChapterUrlPart()}"
             chaptersBuilder.add(
                 MangaChapter(
                     id = generateUid("$scanlator-$chapterId"),
                     title = title,
                     number = number,
                     volume = 0,
-                    url = "/title/$hashId/$chapterId-chapter-${number.toChapterUrlPart()}",
+                    url = chapterUrl,
                     uploadDate = parseRelativeDate(chapterData.optString("createdAtFormatted")),
                     source = source,
                     scanlator = scanlator,
@@ -878,30 +883,65 @@ internal class Comix(context: MangaLoaderContext) :
             })()
         """
 
-        // Same capture technique as browse, but for the title page's chapter
-        // list. Chapters are recognised by a numeric `number` + `id` on the
-        // first item. Resolves with `{ items: [...] }`.
+        // Capture the title page's chapter list. The page only fetches ~20 at a
+        // time, so we accumulate across pages by clicking the site's "Next"
+        // button (each click triggers a new fetch our hook captures), keyed by
+        // the response's page number to avoid duplicates. Resolves with the full
+        // `{ items: [...] }` once there's no next page, a page cap is hit, or the
+        // page goes idle — whichever comes first.
         private const val CHAPTER_CAPTURE_SCRIPT = """
             (async () => {
                 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
                 const original = JSON.parse;
-                let captured = null;
-                const take = (obj) => {
-                    if (captured) return true;
-                    try {
-                        const result = obj && obj.result ? obj.result : obj;
-                        const items = result && result.items;
-                        const first = Array.isArray(items) && items.length > 0 ? items[0] : null;
-                        if (first && first.id !== undefined && first.number !== undefined) {
-                            captured = JSON.stringify({ items: items });
-                            return true;
+                const seenPages = new Set();
+                const items = [];
+                let done = false;
+                let lastActivity = Date.now();
+
+                const isChapters = (arr) =>
+                    Array.isArray(arr) && arr.length > 0 && arr[0] &&
+                    arr[0].id !== undefined && arr[0].number !== undefined;
+
+                const clickNext = () => {
+                    let tries = 0;
+                    const iv = setInterval(() => {
+                        if (done) { clearInterval(iv); return; }
+                        let btn = document.querySelector('.mchap-foot button[aria-label*=Next]');
+                        if (!btn) {
+                            const buttons = document.querySelectorAll('button');
+                            for (const b of buttons) {
+                                const label = (b.getAttribute('aria-label') || '') + ' ' + (b.textContent || '');
+                                if (/next/i.test(label) && !b.disabled) { btn = b; break; }
+                            }
                         }
-                    } catch (e) {}
-                    return false;
+                        if (btn && !btn.disabled) { btn.click(); clearInterval(iv); }
+                        else if (++tries > 40) { clearInterval(iv); done = true; }
+                    }, 100);
                 };
+
+                const capture = (parsed) => {
+                    try {
+                        const result = parsed && parsed.result ? parsed.result : parsed;
+                        const arr = result && result.items;
+                        if (!isChapters(arr)) return;
+                        const meta = (result.meta || result.pagination) || {};
+                        const page = Number(meta.page || meta.currentPage || 1);
+                        if (seenPages.has(page)) return;
+                        seenPages.add(page);
+                        for (const it of arr) items.push(it);
+                        lastActivity = Date.now();
+                        const lastPage = Number(
+                            meta.lastPage || meta.last_page || meta.totalPages || meta.total_pages || 0
+                        );
+                        const hasNext = meta.hasNext === true || meta.hasNext === 1 || meta.hasNext === '1' ||
+                            (lastPage && page < lastPage);
+                        if (hasNext && seenPages.size < 60) clickNext(); else done = true;
+                    } catch (e) {}
+                };
+
                 JSON.parse = function () {
                     const parsed = original.apply(this, arguments);
-                    take(parsed);
+                    capture(parsed);
                     return parsed;
                 };
                 if (typeof window.fetch === 'function') {
@@ -910,7 +950,7 @@ internal class Comix(context: MangaLoaderContext) :
                         return originalFetch.apply(this, arguments).then((response) => {
                             try {
                                 response.clone().text().then((text) => {
-                                    try { take(original(text)); } catch (e) {}
+                                    try { capture(original(text)); } catch (e) {}
                                 }).catch(() => {});
                             } catch (e) {}
                             return response;
@@ -920,24 +960,25 @@ internal class Comix(context: MangaLoaderContext) :
                 const originalSend = XMLHttpRequest.prototype.send;
                 XMLHttpRequest.prototype.send = function () {
                     this.addEventListener('load', function () {
-                        try { take(original(this.responseText)); } catch (e) {}
+                        try { capture(original(this.responseText)); } catch (e) {}
                     });
                     return originalSend.apply(this, arguments);
                 };
-                for (let i = 0; i < 200; i++) {
-                    if (captured) return captured;
-                    try {
-                        const node = document.querySelector('script#initial-data');
-                        if (node && node.textContent) {
-                            const queries = original(node.textContent).queries;
-                            if (queries) {
-                                for (const k in queries) { if (take(queries[k])) break; }
-                            }
-                        }
-                    } catch (e) {}
-                    await sleep(150);
+
+                try {
+                    const node = document.querySelector('script#initial-data');
+                    if (node && node.textContent) {
+                        const queries = original(node.textContent).queries;
+                        if (queries) { for (const k in queries) capture(queries[k]); }
+                    }
+                } catch (e) {}
+
+                for (let i = 0; i < 750; i++) {
+                    if (done) break;
+                    if (items.length > 0 && (Date.now() - lastActivity) > 9000) break;
+                    await sleep(100);
                 }
-                return JSON.stringify({ error: 'no chapter data captured' });
+                return JSON.stringify({ items: items });
             })()
         """
 
