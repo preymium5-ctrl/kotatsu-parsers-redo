@@ -7,10 +7,12 @@ import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.json.JSONArray
 import org.json.JSONObject
+import org.jsoup.HttpStatusException
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
+import org.koitharu.kotatsu.parsers.exception.ParseException
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.util.*
 import java.math.BigInteger
@@ -56,6 +58,30 @@ internal class Kagane(context: MangaLoaderContext) :
     private val UUID_REGEX = Regex(
         "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
     )
+
+    private companion object {
+        val KAGANE_LANGS = arrayOf(
+            "en",
+            "ja",
+            "ko",
+            "zh-Hans",
+            "zh-Hant",
+            "es",
+            "es-419",
+            "fr",
+            "de",
+            "pt",
+            "pt-BR",
+            "ru",
+            "it",
+            "id",
+            "vi",
+            "th",
+            "pl",
+            "hi",
+            "ar",
+        )
+    }
 
     // ---- Debug logging (grep logcat for "KAGANE_DBG") ----
     private fun dbg(msg: String) = println("KAGANE_DBG: $msg")
@@ -149,6 +175,9 @@ internal class Kagane(context: MangaLoaderContext) :
             put("Unofficial")
             put("Mixed")
         })
+        jsonBody.put("content_lang", JSONArray().apply {
+            KAGANE_LANGS.forEach(::put)
+        })
 
         val genreIds = filter.tags.map { it.key }.filter { UUID_REGEX.matches(it) }
         if (genreIds.isNotEmpty()) {
@@ -187,7 +216,19 @@ internal class Kagane(context: MangaLoaderContext) :
             .add("Referer", "https://$domain/")
             .build()
 
-        val responseBody = webClient.httpPost(url.toHttpUrl(), jsonBody, headers).parseRaw()
+        val responseBody = try {
+            webClient.httpPost(url.toHttpUrl(), jsonBody, headers).parseRaw()
+        } catch (e: HttpStatusException) {
+            if (e.statusCode == 403) {
+                requestCloudflareVerification(url, e)
+            } else {
+                throw e
+            }
+        }
+
+        if (responseBody.isCloudflareChallenge()) {
+            requestCloudflareVerification(url)
+        }
 
         val response = try {
             JSONObject(responseBody)
@@ -483,6 +524,26 @@ internal class Kagane(context: MangaLoaderContext) :
                 source = source,
             )
         }
+    }
+
+    private fun requestCloudflareVerification(url: String, cause: Throwable? = null): Nothing {
+        try {
+            context.requestBrowserAction(this, url)
+        } catch (e: UnsupportedOperationException) {
+            throw ParseException(
+                "Cloudflare verification required. Open Kagane in WebView and retry.",
+                url,
+                cause ?: e,
+            )
+        }
+        throw ParseException("Retry after Cloudflare verification.", url, cause)
+    }
+
+    private fun String.isCloudflareChallenge(): Boolean {
+        return contains("cf-mitigated", ignoreCase = true) ||
+            contains("Just a moment", ignoreCase = true) ||
+            contains("challenges.cloudflare.com", ignoreCase = true) ||
+            contains("/cdn-cgi/challenge-platform/", ignoreCase = true)
     }
 
     private data class ManifestPage(

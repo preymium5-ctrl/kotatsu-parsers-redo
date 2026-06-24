@@ -3,12 +3,15 @@ package org.koitharu.kotatsu.parsers.site.all
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
+import okhttp3.Request
 import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
+import org.jsoup.HttpStatusException
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
+import org.koitharu.kotatsu.parsers.exception.ParseException
 import org.koitharu.kotatsu.parsers.model.ContentRating
 import org.koitharu.kotatsu.parsers.model.Manga
 import org.koitharu.kotatsu.parsers.model.MangaChapter
@@ -21,9 +24,9 @@ import org.koitharu.kotatsu.parsers.model.MangaState
 import org.koitharu.kotatsu.parsers.model.MangaTag
 import org.koitharu.kotatsu.parsers.model.RATING_UNKNOWN
 import org.koitharu.kotatsu.parsers.model.SortOrder
+import org.koitharu.kotatsu.parsers.util.await
 import org.koitharu.kotatsu.parsers.util.generateUid
 import org.koitharu.kotatsu.parsers.util.nullIfEmpty
-import org.koitharu.kotatsu.parsers.util.parseJson
 import org.koitharu.kotatsu.parsers.util.parseRaw
 import org.koitharu.kotatsu.parsers.util.parseSafe
 import org.koitharu.kotatsu.parsers.util.suspendlazy.suspendLazy
@@ -110,14 +113,14 @@ internal class LunarAnime(context: MangaLoaderContext) :
 	override suspend fun getDetails(manga: Manga): Manga {
 		val slug = manga.url.substringAfterLast('/')
 		val detailsUrl = "$apiBaseUrl/api/manga/title/$slug"
-		val details = webClient.httpGet(detailsUrl, apiHeaders("GET", detailsUrl)).parseJson()
+		val details = apiGetJson(detailsUrl)
 		val info = details.optJSONObject("manga") ?: return manga
 		val passwordInfo = runCatching {
 			val passwordUrl = "$apiBaseUrl/api/manga/password/info/$slug"
-			webClient.httpGet(passwordUrl, apiHeaders("GET", passwordUrl)).parseJson()
+			apiGetJson(passwordUrl)
 		}.getOrNull()
 		val chaptersUrl = "$apiBaseUrl/api/manga/$slug"
-		val chaptersRoot = webClient.httpGet(chaptersUrl, apiHeaders("GET", chaptersUrl)).parseJson()
+		val chaptersRoot = apiGetJson(chaptersUrl)
 
 		return parseManga(info).copy(
 			id = manga.id,
@@ -154,7 +157,7 @@ internal class LunarAnime(context: MangaLoaderContext) :
 
 	private suspend fun fetchRecent(page: Int): List<Manga> {
 		val url = "$apiBaseUrl/api/manga/recent?page=$page&limit=$pageSize"
-		val root = webClient.httpGet(url, apiHeaders("GET", url)).parseJson()
+		val root = apiGetJson(url)
 		val mangas = root.optJSONArray("our_mangas") ?: root.optJSONArray("mangas")
 		return List(mangas?.length() ?: 0) { index ->
 			parseManga(mangas!!.getJSONObject(index))
@@ -198,7 +201,7 @@ internal class LunarAnime(context: MangaLoaderContext) :
 		url.addQueryParameter("sort", "relevance")
 
 		val builtUrl = url.build()
-		val root = webClient.httpGet(builtUrl, apiHeaders("GET", builtUrl.toString())).parseJson()
+		val root = apiGetJson(builtUrl.toString())
 		val mangas = root.optJSONArray("manga") ?: JSONArray()
 		return List(mangas.length()) { index ->
 			parseManga(mangas.getJSONObject(index))
@@ -331,10 +334,7 @@ internal class LunarAnime(context: MangaLoaderContext) :
 
 	private suspend fun fetchLanguages(): Set<Locale> {
 		val url = "$apiBaseUrl/api/manga/recent?page=1&limit=1"
-		val root = webClient.httpGet(
-			url,
-			apiHeaders("GET", url),
-		).parseJson()
+		val root = apiGetJson(url)
 		return parseStringArray(root.optJSONArray("available_languages"))
 			.mapTo(LinkedHashSet()) { Locale(normalizeLanguageCode(it)) }
 	}
@@ -343,10 +343,7 @@ internal class LunarAnime(context: MangaLoaderContext) :
 		val tags = LinkedHashSet<MangaTag>()
 		for (page in 1..3) {
 			val url = "$apiBaseUrl/api/manga/search?page=$page&limit=100"
-			val root = webClient.httpGet(
-				url,
-				apiHeaders("GET", url),
-			).parseJson()
+			val root = apiGetJson(url)
 			val mangas = root.optJSONArray("manga") ?: break
 			for (i in 0 until mangas.length()) {
 				val genres = parseStringArray(mangas.getJSONObject(i).optString("genres"))
@@ -365,6 +362,24 @@ internal class LunarAnime(context: MangaLoaderContext) :
 		return tags.sortedBy { it.title }.toCollection(LinkedHashSet())
 	}
 
+	private suspend fun apiGetJson(url: String): JSONObject {
+		val request = Request.Builder()
+			.get()
+			.url(url)
+			.headers(apiHeaders("GET", url))
+			.build()
+		return context.httpClient.newCall(request).await().use { response ->
+			val body = response.body.string()
+			if (response.code == 403 && body.isDeviceValidationResponse()) {
+				requestDeviceValidation()
+			}
+			if (!response.isSuccessful) {
+				throw HttpStatusException(response.message, response.code, response.request.url.toString())
+			}
+			JSONObject(body)
+		}
+	}
+
 	private suspend fun apiHeaders(method: String, url: String): Headers {
 		val dpop = signUrl(method, url.substringBefore('?'))
 		return getRequestHeaders().newBuilder().apply {
@@ -372,6 +387,21 @@ internal class LunarAnime(context: MangaLoaderContext) :
 				add("dpop", dpop)
 			}
 		}.build()
+	}
+
+	private fun requestDeviceValidation(): Nothing {
+		keyPairJson = null
+		dpopPrivateKey = null
+		val validationUrl = "https://$domain/validate?redirect=/"
+		try {
+			context.requestBrowserAction(this, validationUrl)
+		} catch (e: UnsupportedOperationException) {
+			throw ParseException(
+				"Device validation required. Open Lunar Manga in WebView and retry.",
+				validationUrl,
+				e,
+			)
+		}
 	}
 
 	private suspend fun signUrl(method: String, url: String): String {
@@ -480,7 +510,7 @@ internal class LunarAnime(context: MangaLoaderContext) :
 
 	private suspend fun fetchSessionData(token: String, lang: String): String {
 		val url = "$apiBaseUrl/api/manga/r/$token?lang=$lang"
-		val root = webClient.httpGet(url, apiHeaders("GET", url)).parseJson()
+		val root = apiGetJson(url)
 		return root.optJSONObject("data")
 			?.optString("session_data")
 			?.nullIfEmpty()
@@ -592,6 +622,13 @@ internal class LunarAnime(context: MangaLoaderContext) :
 			.replace(unicodeEscapeRegex) { match ->
 				match.groupValues[1].toInt(16).toChar().toString()
 			}
+	}
+
+	private fun String.isDeviceValidationResponse(): Boolean {
+		return contains("requires_device_binding", ignoreCase = true) ||
+			contains("requires_validation", ignoreCase = true) ||
+			contains("Device not validated", ignoreCase = true) ||
+			contains("validate", ignoreCase = true)
 	}
 
 	private fun parseDecryptedPayload(payload: String): JSONObject? {
