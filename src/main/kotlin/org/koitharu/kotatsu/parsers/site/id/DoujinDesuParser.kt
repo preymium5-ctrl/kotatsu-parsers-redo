@@ -15,7 +15,7 @@ internal class DoujinDesuParser(context: MangaLoaderContext) :
 	PagedMangaParser(context, MangaParserSource.DOUJINDESU, pageSize = 18) {
 
 	override val configKeyDomain: ConfigKey.Domain
-		get() = ConfigKey.Domain("doujindesu.tv")
+		get() = ConfigKey.Domain("doujin.desu.xxx")
 
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
@@ -52,7 +52,7 @@ internal class DoujinDesuParser(context: MangaLoaderContext) :
 		val url = urlBuilder().apply {
             when {
                 page > 1 -> addPathSegments("manga/page/$page/")
-                else -> addPathSegment("manga/")
+                else -> addPathSegments("manga/")
             }
 
             addQueryParameter(
