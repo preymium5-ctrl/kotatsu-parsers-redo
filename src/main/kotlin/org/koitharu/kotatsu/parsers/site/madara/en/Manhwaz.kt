@@ -6,7 +6,7 @@ import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.site.madara.MadaraParser
 import org.koitharu.kotatsu.parsers.util.*
 
-@MangaSourceParser("MANHWAZ", "ManhwaZ", "en")
+@MangaSourceParser("MANHWAZ", "ManhwaZ", "en", type = ContentType.MANHWA)
 internal class Manhwaz(context: MangaLoaderContext) :
     MadaraParser(context, MangaParserSource.MANHWAZ, "manhwaz.com", 40) {
 
