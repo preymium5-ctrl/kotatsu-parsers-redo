@@ -65,7 +65,7 @@ internal class NHentaiParser(context: MangaLoaderContext) :
 	}
 
 	override suspend fun getFilterOptions() = MangaListFilterOptions(
-		availableLocales = setOf(Locale.ENGLISH, Locale.JAPANESE, Locale.CHINESE),
+		availableLocales = setOf(Locale.ENGLISH),
 		availableTags = mapTags()
 	)
 
@@ -103,12 +103,13 @@ internal class NHentaiParser(context: MangaLoaderContext) :
 					append("$apiUrl/galleries/$numericQuery")
 				} else {
 					append("$apiUrl/search?query=")
-					append(numericQuery.urlEncoded())
+					val fullQuery = "$numericQuery language:english"
+					append(fullQuery.urlEncoded())
 					append("&page=$page")
 				}
 			} else {
 				append("$apiUrl/search?query=")
-				val advQuery = buildQuery(filter.tags, filter.locale)
+				val advQuery = buildQuery(filter.tags, Locale.ENGLISH)
 				append(if (advQuery.isEmpty()) "\"\"" else advQuery.urlEncoded())
 				when (order) {
 					SortOrder.POPULARITY -> append("&sort=popular")

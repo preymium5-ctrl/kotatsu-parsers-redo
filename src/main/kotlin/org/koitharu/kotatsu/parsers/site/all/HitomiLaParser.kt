@@ -85,13 +85,10 @@ internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser
 
 	override suspend fun getFilterOptions() = MangaListFilterOptions(
 		availableTags = fetchAvailableTags(),
-		availableLocales = localeMap.keys,
+		availableLocales = setOf(Locale.ENGLISH),
 	)
 
-	private fun Locale?.getSiteLang(): String = when (this) {
-		null -> "all"
-		else -> localeMap[this] ?: "all"
-	}
+	private fun Locale?.getSiteLang(): String = "english"
 
 	private suspend fun fetchAvailableTags(): Set<MangaTag> = coroutineScope {
 		('a'..'z').map { alphabet ->
@@ -185,7 +182,7 @@ internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser
 
 		else -> {
 			if (offset == 0) {
-				cachedSearchIds = hitomiSearch(filter.query, order).toList()
+				cachedSearchIds = hitomiSearch(filter.query, order, filter.locale.getSiteLang()).toList()
 			}
 			cachedSearchIds.subList(offset, min(offset + 25, cachedSearchIds.size))
 		}
