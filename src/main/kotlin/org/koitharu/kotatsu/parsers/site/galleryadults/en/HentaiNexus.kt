@@ -1,5 +1,6 @@
 package org.koitharu.kotatsu.parsers.site.galleryadults.en
 
+import okhttp3.Headers
 import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.nodes.Document
@@ -43,6 +44,11 @@ internal class HentaiNexus(context: MangaLoaderContext) :
 	override val selectLanguageChapter = ""
 	override val selectUrlChapter = ""
 	override val selectTotalPage = ".section div.container:nth-child(2) > div.box > div.columns div.column"
+
+	override fun getRequestHeaders(): Headers = super.getRequestHeaders().newBuilder()
+		.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
+		.set("Referer", "https://$domain/")
+		.build()
 
 	val selectReadUrl = "a:contains(Read Online)"
 	val selectPublisher = "tr:contains(Publisher) td:nth-child(2)"
@@ -208,13 +214,15 @@ internal class HentaiNexus(context: MangaLoaderContext) :
 	private suspend fun getPagesInternal(chapterUrl: String, document: Document? = null): List<MangaPage> {
 		val document = document ?: webClient.httpGet(chapterUrl.toAbsoluteUrl(domain)).parseHtml()
 		val readUrl = document.selectFirstOrThrow(selectReadUrl).attr("href")
+		decryptedPagesData = getPageUrlInternal(readUrl)
+		mangaPagesInternalId = readUrl.split("/").last()
 
-		return document.select(selectTotalPage).mapIndexed { index, element ->
+		return decryptedPagesData.mapIndexed { index, _ ->
 			val url = "$readUrl#${index + 1}"
 			MangaPage(
 				id = generateUid(url),
 				url = url,
-				preview = element.select("img").attr("src"),
+				preview = null,
 				source = source,
 			)
 		}
@@ -222,7 +230,7 @@ internal class HentaiNexus(context: MangaLoaderContext) :
 
 	private suspend fun getPageUrlInternal(pageUrl: String) : List<String> {
 		val doc = webClient.httpGet(pageUrl.toAbsoluteUrl(domain)).parseHtml()
-		val encryptedPagesData = doc.selectFirstOrThrow("script:not([src])").toString()
+		val encryptedPagesData = doc.selectFirstOrThrow("script:containsData(initReader)").toString()
 			.substringAfter("initReader(\"")
 			.substringBefore("\",")
 		val decryptedString = decrypt(encryptedPagesData).replace("\\/", "/")
@@ -232,7 +240,12 @@ internal class HentaiNexus(context: MangaLoaderContext) :
 
 		for (i in 0 until jsonArrayData.length()) {
 			val item = jsonArrayData.get(i) as JSONObject
-			pagesData.add(item.get("image") as String)
+			val imageUrl = item.optString("image_avif")
+				.ifEmpty { item.optString("image") }
+				.ifEmpty { item.optString("image_fallback") }
+			if (imageUrl.isNotEmpty()) {
+				pagesData.add(imageUrl.toAbsoluteUrl(domain))
+			}
 		}
 
 		return pagesData
