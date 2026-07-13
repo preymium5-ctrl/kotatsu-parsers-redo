@@ -161,11 +161,18 @@ internal class DivascansParser(context: MangaLoaderContext) :
 		val chapters = parseChaptersFromHtml(html, typePath, slug)
 		val description = extractDescription(html) ?: manga.description
 		val author = extractAuthor(html)
+		val detailTags = extractTagsFromHtml(html)
+		val tags = when {
+			detailTags.isNotEmpty() -> detailTags
+			manga.tags.isNotEmpty() -> manga.tags
+			else -> emptySet()
+		}
 		val isMature = html.contains("\"isMature\":true") || html.contains("\\\"isMature\\\":true")
 
 		return manga.copy(
 			description = description,
 			authors = author?.let { setOf(it) } ?: manga.authors,
+			tags = tags,
 			contentRating = when {
 				isMature || manga.contentRating == ContentRating.ADULT -> ContentRating.ADULT
 				else -> manga.contentRating
@@ -569,6 +576,65 @@ internal class DivascansParser(context: MangaLoaderContext) :
 			""""author"\s*:\s*\{\s*"@type"\s*:\s*"Person"\s*,\s*"name"\s*:\s*"([^"]+)"""",
 		).find(html)
 		return m?.groupValues?.get(1)?.nullIfEmpty()
+	}
+
+	/**
+	 * Pull the full genre list from the series detail page (RSC/JSON payloads).
+	 * List endpoints sometimes omit names or return partial genres.
+	 */
+	private fun extractTagsFromHtml(html: String): Set<MangaTag> {
+		val result = LinkedHashMap<String, MangaTag>()
+		fun addTag(keyRaw: String, nameRaw: String?) {
+			val key = keyRaw.trim().nullIfEmpty() ?: return
+			val title = nameRaw?.trim()?.nullIfEmpty()
+				?: key.replace('-', ' ').toTitleCase(sourceLocale)
+			val existing = result[key]
+			if (existing == null || existing.title.equals(existing.key, ignoreCase = true)) {
+				result[key] = MangaTag(key = key, title = title.toTitleCase(sourceLocale), source = source)
+			}
+		}
+
+		// Unescaped or escaped genre objects: {"slug":"romance","name":"Romance"}
+		val objectRegex = Regex(
+			"""\{[^{}]*?"slug"\s*:\s*"([^"]+)"[^{}]*?(?:"name"\s*:\s*"([^"]*)")?[^{}]*?\}""",
+		)
+		// Escaped RSC form: {\"slug\":\"romance\",\"name\":\"Romance\"}
+		val escapedObjectRegex = Regex(
+			"""\{[^{}]*?\\"slug\\"\s*:\s*\\"([^"\\]+)\\"[^{}]*?(?:\\"name\\"\s*:\s*\\"([^"\\]*)\\")?[^{}]*?\}""",
+		)
+
+		// Prefer the genres array block(s) so we don't pick up unrelated slug fields.
+		val genreBlocks = ArrayList<String>()
+		Regex(""""genres"\s*:\s*\[(.*?)\]""", setOf(RegexOption.DOT_MATCHES_ALL))
+			.findAll(html)
+			.forEach { genreBlocks += it.groupValues[1] }
+		Regex("""\\"genres\\"\s*:\s*\[(.*?)\]""", setOf(RegexOption.DOT_MATCHES_ALL))
+			.findAll(html)
+			.forEach { genreBlocks += it.groupValues[1] }
+
+		val searchIn = if (genreBlocks.isNotEmpty()) {
+			genreBlocks.joinToString("\n")
+		} else {
+			html
+		}
+
+		for (match in objectRegex.findAll(searchIn)) {
+			addTag(match.groupValues[1], match.groupValues.getOrNull(2))
+		}
+		for (match in escapedObjectRegex.findAll(searchIn)) {
+			addTag(match.groupValues[1], match.groupValues.getOrNull(2))
+		}
+
+		// Fallback: plain "name":"Romance" entries inside a genres block.
+		if (result.isEmpty()) {
+			for (block in genreBlocks) {
+				for (match in Regex(""""name"\s*:\s*"([^"]+)"""").findAll(block)) {
+					val name = match.groupValues[1]
+					addTag(name.lowercase(Locale.ROOT).replace(' ', '-'), name)
+				}
+			}
+		}
+		return result.values.toSet()
 	}
 
 	private companion object {
