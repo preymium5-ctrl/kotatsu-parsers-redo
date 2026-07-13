@@ -45,7 +45,9 @@ internal class DivaScans(context: MangaLoaderContext) :
         get() = MangaListFilterCapabilities(
             isSearchSupported = true,
             isSearchWithFiltersSupported = true,
+            // API only accepts a single genre query; extra tags are AND-filtered client-side.
             isMultipleTagsSupported = true,
+            // API has no reliable exclude-genre param — applied client-side after fetch.
             isTagsExclusionSupported = true,
         )
 
@@ -114,13 +116,11 @@ internal class DivaScans(context: MangaLoaderContext) :
                 if (sortStr.isNotEmpty()) {
                     addQueryParameter("sort", sortStr)
                 }
-                if (filter.tags.isNotEmpty()) {
-                    addQueryParameter("genre", filter.tags.joinToString(",") { it.key })
+                // Server supports one genre param; remaining tags filtered in applyLocalFilters.
+                filter.tags.firstOrNull()?.let { tag ->
+                    addQueryParameter("genre", tag.key)
                 }
-                if (filter.tagsExclude.isNotEmpty()) {
-                    addQueryParameter("exgenre", filter.tagsExclude.joinToString(",") { it.key })
-                }
-                
+
                 if (filter.states.isNotEmpty()) {
                     val statesStr = filter.states.mapNotNull { state ->
                         when (state) {
@@ -178,6 +178,8 @@ internal class DivaScans(context: MangaLoaderContext) :
             
             val isMature = obj.optBoolean("isMature", false)
 
+            val tags = parseTagsFromSeries(obj)
+
             list.add(
                 Manga(
                     id = generateUid(slug),
@@ -188,14 +190,45 @@ internal class DivaScans(context: MangaLoaderContext) :
                     altTitles = emptySet<String>(),
                     rating = RATING_UNKNOWN,
                     contentRating = if (isMature) ContentRating.ADULT else ContentRating.SAFE,
-                    tags = emptySet<MangaTag>(),
+                    tags = tags,
                     state = state,
                     authors = emptySet<String>(),
                     source = source,
                 )
             )
         }
-        return list.distinctBy { it.url }
+        return applyLocalFilters(list.distinctBy { it.url }, filter)
+    }
+
+    /**
+     * Client-side filters the API does not fully honour:
+     * - multiple include tags (AND — series must have every selected genre)
+     * - exclude tags
+     */
+    private fun applyLocalFilters(list: List<Manga>, filter: MangaListFilter): List<Manga> {
+        if (filter.tags.isEmpty() && filter.tagsExclude.isEmpty()) return list
+        val includeKeys = filter.tags.mapToSet { it.key }
+        val excludeKeys = filter.tagsExclude.mapToSet { it.key }
+        return list.filter { manga ->
+            val mangaKeys = manga.tags.mapToSet { it.key }
+            (includeKeys.isEmpty() || includeKeys.all { it in mangaKeys }) &&
+                (excludeKeys.isEmpty() || mangaKeys.none { it in excludeKeys })
+        }
+    }
+
+    private fun parseTagsFromSeries(obj: JSONObject): Set<MangaTag> {
+        val genres = obj.optJSONArray("genres") ?: return emptySet()
+        val tags = mutableSetOf<MangaTag>()
+        for (i in 0 until genres.length()) {
+            val g = genres.optJSONObject(i) ?: continue
+            val genreObj = g.optJSONObject("genre") ?: g
+            val key = genreObj.optString("slug").ifEmpty { genreObj.optString("name") }
+            val name = genreObj.optString("name").ifEmpty { key }
+            if (key.isNotEmpty() && name.isNotEmpty()) {
+                tags.add(MangaTag(key = key, title = name, source = source))
+            }
+        }
+        return tags
     }
 
     private fun extractRscData(doc: org.jsoup.nodes.Document): String {
