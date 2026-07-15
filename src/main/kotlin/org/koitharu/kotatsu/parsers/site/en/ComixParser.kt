@@ -520,9 +520,14 @@ internal class Comix(context: MangaLoaderContext) :
     }
 
     private suspend fun getChapters(manga: Manga): List<MangaChapter> {
-        val hashId = manga.url.substringAfter("/title/")
+        val hashId = manga.url.substringAfter("/title/").substringBefore('?').substringBefore('#')
         val allChapters = loadAllChapters(hashId)
-        val parsed = (0 until allChapters.length()).map { allChapters.getJSONObject(it) }
+        if (allChapters.length() == 0) {
+            return emptyList()
+        }
+        val parsed = (0 until allChapters.length()).mapNotNull { i ->
+            allChapters.optJSONObject(i)
+        }
 
         // Comix mixes many scanlation teams into one list, which is messy to read
         // and full of duplicates. Pick the single most consistent team (best
@@ -535,9 +540,15 @@ internal class Comix(context: MangaLoaderContext) :
 
         val chaptersBuilder = ChaptersListBuilder(chapters.size)
         for (chapterData in chapters) {
-            val chapterId = chapterData.getLong("id")
-            val number = chapterData.getDouble("number").toFloat()
+            val chapterId = chapterData.optLong("id", 0L).takeIf { it != 0L }
+                ?: chapterData.optString("id").toLongOrNull()
+                ?: continue
+            val number = chapterData.optDouble("number", Double.NaN)
+                .takeUnless { it.isNaN() }
+                ?.toFloat()
+                ?: continue
             val name = chapterData.optString("name", "").nullIfEmpty()
+                ?: chapterData.optString("title", "").nullIfEmpty()
             val scanlator = teamNameOf(chapterData)
             val title = if (name != null) {
                 "Chapter $number: $name"
@@ -548,6 +559,7 @@ internal class Comix(context: MangaLoaderContext) :
             // title slug (e.g. `/title/x0ynk-villains.../<id>-chapter-N`). The
             // hashId-only path 404s in the reader.
             val chapterUrl = chapterData.optString("url").nullIfEmpty()
+                ?: chapterData.optString("path").nullIfEmpty()
                 ?: "/title/$hashId/$chapterId-chapter-${number.toChapterUrlPart()}"
             chaptersBuilder.add(
                 MangaChapter(
@@ -556,7 +568,11 @@ internal class Comix(context: MangaLoaderContext) :
                     number = number,
                     volume = 0,
                     url = chapterUrl,
-                    uploadDate = parseRelativeDate(chapterData.optString("createdAtFormatted")),
+                    uploadDate = parseRelativeDate(
+                        chapterData.optString("createdAtFormatted").nullIfEmpty()
+                            ?: chapterData.optString("created_at_formatted").nullIfEmpty()
+                            ?: chapterData.optString("createdAt").nullIfEmpty(),
+                    ),
                     source = source,
                     scanlator = scanlator,
                     branch = scanlator,
@@ -570,14 +586,18 @@ internal class Comix(context: MangaLoaderContext) :
     private fun teamKeyOf(chapter: JSONObject): String {
         val group = chapter.optJSONObject("group") ?: chapter.optJSONObject("scanlation_group")
         group?.optIntOrNull("id")?.let { return "g$it" }
+        chapter.optIntOrNull("groupId")?.let { return "g$it" }
+        chapter.optIntOrNull("group_id")?.let { return "g$it" }
         group?.optString("name")?.nullIfEmpty()?.let { return "n:${it.lowercase(Locale.US)}" }
-        return if (chapter.optBoolean("isOfficial")) "official" else "unknown"
+        return if (chapter.optBoolean("isOfficial") || chapter.optBoolean("is_official")) "official" else "unknown"
     }
 
     private fun teamNameOf(chapter: JSONObject): String {
         val group = chapter.optJSONObject("group") ?: chapter.optJSONObject("scanlation_group")
         return group?.optString("name")?.nullIfEmpty()
-            ?: if (chapter.optBoolean("isOfficial")) "Official" else "Unknown"
+            ?: chapter.optString("groupName").nullIfEmpty()
+            ?: chapter.optString("group_name").nullIfEmpty()
+            ?: if (chapter.optBoolean("isOfficial") || chapter.optBoolean("is_official")) "Official" else "Unknown"
     }
 
     /**
@@ -635,13 +655,166 @@ internal class Comix(context: MangaLoaderContext) :
     private suspend fun loadAllChapters(hashId: String): JSONArray {
         val titleUrl = "https://$domain/title/$hashId"
 
-        // Let the title page fetch (and decrypt) its chapter list and capture what
-        // it parses. The script prefers the fast single-team path: it reads the
-        // dominant team off the first page, then sets `?group_id=<id>` on the URL
-        // (the SPA reads it and refetches just that team), and paginates within it.
-        // If the URL filter doesn't take, it falls back to paginating every team.
-        val response = evaluateWebViewApiJson(titleUrl, CHAPTER_SCRIPT)
-        return response.optJSONArray("items") ?: JSONArray()
+        // 1) Plain GET / rendered HTML: SSR initial-data or DOM chapter links.
+        val firstDoc = runCatching {
+            loadRenderedDocument(titleUrl) { doc ->
+                extractInitialDataChapters(doc) != null || extractDomChapters(doc).length() > 0
+            }
+        }.getOrNull()
+        firstDoc?.let { doc ->
+            extractInitialDataChapters(doc)?.takeIf { it.length() > 0 }?.let { return it }
+            extractDomChapters(doc).takeIf { it.length() > 0 }?.let { return it }
+        }
+
+        // 2) Preferred path: load HTML with capture hooks already in <head>, so the
+        // SPA's signed chapter XHR is observed before responses finish. (Injecting
+        // only on onPageFinished is too late and yielded empty lists.)
+        runCatching {
+            loadChaptersViaBootstrappedWebView(titleUrl)
+        }.getOrNull()?.takeIf { it.length() > 0 }?.let { return it }
+
+        // 3) evaluateJs polling: install hooks + paginate + scrape DOM.
+        runCatching {
+            val raw = context.evaluateJs(titleUrl, CHAPTER_POLL_SCRIPT, WEBVIEW_API_TIMEOUT)
+            parseChapterPollResult(raw)
+        }.getOrNull()?.takeIf { it.length() > 0 }?.let { return it }
+
+        // 4) Legacy intercept bridge (location redirect) as last resort.
+        val response = runCatching {
+            evaluateWebViewApiJson(titleUrl, CHAPTER_SCRIPT)
+        }.getOrNull()
+        response?.optJSONArray("items")?.takeIf { it.length() > 0 }?.let { return it }
+
+        // 5) Re-scrape after cookies/WebView may have warmed.
+        runCatching {
+            loadRenderedDocument(titleUrl) { doc ->
+                extractInitialDataChapters(doc) != null || extractDomChapters(doc).length() > 0
+            }?.let { doc ->
+                extractInitialDataChapters(doc)?.takeIf { it.length() > 0 }
+                    ?: extractDomChapters(doc).takeIf { it.length() > 0 }
+            }
+        }.getOrNull()?.let { return it }
+
+        return response?.optJSONArray("items") ?: JSONArray()
+    }
+
+    /**
+     * Fetches the title page HTML, injects chapter-capture bootstrap into <head>,
+     * and runs it in a WebView so hooks exist before the SPA fetches chapters.
+     */
+    private suspend fun loadChaptersViaBootstrappedWebView(titleUrl: String): JSONArray? {
+        val html = runCatching {
+            webClient.httpGet(titleUrl).parseHtml()
+        }.getOrNull()?.outerHtml()
+            ?: runCatching {
+                context.evaluateJs(titleUrl, PAGE_HTML_SCRIPT, WEBVIEW_PAGE_TIMEOUT)
+            }.getOrNull()?.let { decodeEvaluateJsString(it) }
+
+        if (html.isNullOrBlank() || isCloudflarePage(html)) {
+            if (!html.isNullOrBlank() && isCloudflarePage(html)) {
+                requestCloudflareVerification(titleUrl)
+            }
+            return null
+        }
+
+        val bootstrapped = injectHeadScript(html, CHAPTER_BOOTSTRAP_SCRIPT)
+        val response = evaluateWebViewApiJson(
+            pageUrl = titleUrl,
+            script = CHAPTER_WAIT_SCRIPT,
+            pageHtml = bootstrapped,
+            pageBaseUrl = titleUrl,
+        )
+        return response.optJSONArray("items")?.takeIf { it.length() > 0 }
+    }
+
+    private fun injectHeadScript(html: String, script: String): String {
+        val tag = "<script>$script</script>"
+        val headClose = html.indexOf("</head>", ignoreCase = true)
+        return if (headClose >= 0) {
+            html.substring(0, headClose) + tag + html.substring(headClose)
+        } else {
+            tag + html
+        }
+    }
+
+    private fun parseChapterPollResult(raw: String?): JSONArray? {
+        if (raw.isNullOrBlank() || raw == "null") return null
+        val decoded = decodeEvaluateJsString(raw)
+        if (decoded.isBlank() || decoded == "null") return null
+        val json = runCatching { JSONObject(decoded) }.getOrNull() ?: return null
+        return json.optJSONArray("items")?.takeIf { it.length() > 0 }
+    }
+
+    private fun decodeEvaluateJsString(raw: String): String {
+        val value = raw.trim()
+        if (value.length >= 2 && value.first() == '"' && value.last() == '"') {
+            return value.substring(1, value.length - 1)
+                .replace("\\\\", "\\")
+                .replace("\\\"", "\"")
+                .replace("\\n", "\n")
+                .replace("\\r", "\r")
+                .replace("\\t", "\t")
+                .replace(Regex("""\\u([0-9a-fA-F]{4})""")) { m ->
+                    m.groupValues[1].toInt(16).toChar().toString()
+                }
+        }
+        return value
+    }
+
+    /** Pull chapter items out of `script#initial-data` when the SPA embeds them. */
+    private fun extractInitialDataChapters(document: Document): JSONArray? {
+        val raw = document.selectFirst("script#initial-data")?.data()?.nullIfEmpty() ?: return null
+        val queries = runCatching { JSONObject(raw).optJSONObject("queries") }.getOrNull() ?: return null
+        var best: JSONArray? = null
+        for (key in queries.keys()) {
+            val value = queries.optJSONObject(key) ?: continue
+            val result = value.optJSONObject("result") ?: value
+            val items = result.optJSONArray("items") ?: continue
+            if (items.length() == 0) continue
+            val first = items.optJSONObject(0) ?: continue
+            val looksLikeChapter = first.has("number") || first.has("chapter_number") ||
+                first.has("name") && (first.has("id") || first.has("hid"))
+            if (!looksLikeChapter) continue
+            if (best == null || items.length() > best.length()) {
+                best = items
+            }
+        }
+        return best
+    }
+
+    /**
+     * Fallback when JSON capture fails: scrape chapter anchors from the rendered
+     * title page (first page only, but better than an empty list).
+     */
+    private fun extractDomChapters(document: Document): JSONArray {
+        val items = JSONArray()
+        val seen = HashSet<String>()
+        val anchors = document.select("a[href*='/title/']")
+        for (a in anchors) {
+            val href = a.attr("href").trim()
+            // Chapter URLs look like /title/<slug>/<id>-chapter-N or .../<id>-...
+            val match = CHAPTER_HREF_REGEX.find(href) ?: continue
+            val chapterId = match.groupValues[1]
+            if (!seen.add(chapterId)) continue
+            val number = match.groupValues.getOrNull(2)?.toDoubleOrNull()
+                ?: a.text().let { CHAPTER_NUM_TEXT_REGEX.find(it)?.groupValues?.getOrNull(1)?.toDoubleOrNull() }
+                ?: continue
+            val name = a.text().trim().nullIfEmpty()
+            val path = if (href.startsWith("http", ignoreCase = true)) {
+                href.toHttpUrl().encodedPath
+            } else {
+                href.substringBefore('?').substringBefore('#')
+            }
+            items.put(
+                JSONObject()
+                    .put("id", chapterId.toLongOrNull() ?: chapterId.hashCode().toLong())
+                    .put("number", number)
+                    .put("name", name ?: "")
+                    .put("url", path)
+                    .put("isOfficial", false),
+            )
+        }
+        return items
     }
 
     private fun extractInitialDataPages(document: Document): JSONObject? {
@@ -657,7 +830,12 @@ internal class Comix(context: MangaLoaderContext) :
 
     private fun apiUrl(path: String): String = "https://$domain/api/v1/${path.removePrefix("/")}"
 
-    private suspend fun evaluateWebViewApiJson(pageUrl: String, script: String): JSONObject {
+    private suspend fun evaluateWebViewApiJson(
+        pageUrl: String,
+        script: String,
+        pageHtml: String? = null,
+        pageBaseUrl: String? = null,
+    ): JSONObject {
         val bridgeScript = buildWebViewApiBridgeScript(script)
         val requests = runCatching {
             context.interceptWebViewRequests(
@@ -667,6 +845,8 @@ internal class Comix(context: MangaLoaderContext) :
                     maxRequests = 1,
                     urlPattern = INTERCEPT_URL_REGEX,
                     pageScript = bridgeScript,
+                    pageHtml = pageHtml,
+                    pageBaseUrl = pageBaseUrl,
                 ),
             )
         }.getOrElse { e ->
@@ -866,27 +1046,303 @@ internal class Comix(context: MangaLoaderContext) :
         private const val WEBVIEW_PAGE_ATTEMPTS = 3
         private const val WEBVIEW_PAGE_TIMEOUT = 20000L
 
-        // Loads the chapter list, preferring a single team. It reads the dominant
-        // team off the all-teams first page, then switches the URL to that team's
-        // `?group_id=<id>` (pushState + popstate, which the SPA reads and refetches),
-        // and paginates within that team via the "Next" button. If the URL filter
-        // never yields a single-team response it falls back to paginating all teams.
+        // Early bootstrap: installed in <head> before SPA JS so chapter XHR is captured.
+        private const val CHAPTER_BOOTSTRAP_SCRIPT = """
+            (function () {
+                if (window.__comixChapterState) return;
+                const original = JSON.parse;
+                const state = window.__comixChapterState = {
+                    items: [],
+                    seenPages: new Set(),
+                    seenIds: new Set(),
+                    lastPage: 1,
+                    lastChange: Date.now(),
+                    gotAny: false
+                };
+                const chapterId = (ch) => ch && (ch.id != null ? String(ch.id) : (ch.hid != null ? String(ch.hid) : null));
+                const chapterNumber = (ch) => {
+                    if (!ch) return null;
+                    if (ch.number != null) return Number(ch.number);
+                    if (ch.chapter_number != null) return Number(ch.chapter_number);
+                    return null;
+                };
+                const isChapters = (arr) =>
+                    Array.isArray(arr) && arr.length > 0 && arr[0] &&
+                    chapterId(arr[0]) != null && chapterNumber(arr[0]) != null;
+                const pushItems = (arr, page, last) => {
+                    if (!isChapters(arr)) return false;
+                    const p = Number(page || 1);
+                    if (state.seenPages.has(p)) return true;
+                    state.seenPages.add(p);
+                    if (last && Number(last) > state.lastPage) state.lastPage = Number(last);
+                    for (const ch of arr) {
+                        const id = chapterId(ch);
+                        if (id != null && state.seenIds.has(id)) continue;
+                        if (id != null) state.seenIds.add(id);
+                        if (ch.number == null && ch.chapter_number != null) ch.number = ch.chapter_number;
+                        state.items.push(ch);
+                    }
+                    state.gotAny = state.items.length > 0;
+                    state.lastChange = Date.now();
+                    return true;
+                };
+                const onParsed = (parsed) => {
+                    try {
+                        const result = parsed && parsed.result ? parsed.result : parsed;
+                        const arr = result && result.items;
+                        if (!isChapters(arr)) return;
+                        const meta = (result.meta || result.pagination) || {};
+                        pushItems(
+                            arr,
+                            meta.page || 1,
+                            meta.lastPage || meta.last_page || meta.totalPages || meta.total_pages || 1
+                        );
+                    } catch (e) {}
+                };
+                JSON.parse = function () { const p = original.apply(this, arguments); onParsed(p); return p; };
+                if (typeof window.fetch === 'function') {
+                    const of = window.fetch;
+                    window.fetch = function () {
+                        return of.apply(this, arguments).then((res) => {
+                            try { res.clone().text().then((t) => { try { onParsed(original(t)); } catch (e) {} }).catch(() => {}); } catch (e) {}
+                            return res;
+                        });
+                    };
+                }
+                const os = XMLHttpRequest.prototype.send;
+                XMLHttpRequest.prototype.send = function () {
+                    this.addEventListener('load', function () { try { onParsed(original(this.responseText)); } catch (e) {} });
+                    return os.apply(this, arguments);
+                };
+                try {
+                    const raw = document.querySelector('script#initial-data')?.textContent;
+                    if (raw) {
+                        const data = original(raw);
+                        const queries = data && data.queries;
+                        if (queries) for (const key of Object.keys(queries)) { try { onParsed(queries[key]); } catch (e) {} }
+                    }
+                } catch (e) {}
+            })();
+        """
+
+        // Waits on bootstrap state, paginates via Next, scrapes DOM if needed.
+        // Resolves with JSON string `{ items: [...] }`.
+        private const val CHAPTER_WAIT_SCRIPT = """
+            (async () => {
+                const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+                const ensure = () => {
+                    if (!window.__comixChapterState) {
+                        $CHAPTER_BOOTSTRAP_SCRIPT
+                    }
+                    return window.__comixChapterState;
+                };
+                let state = ensure();
+                const findNextButton = (page) => {
+                    let btn = document.querySelector('.mchap-foot button[aria-label*=Next i], .mchap-foot button[aria-label*=next]');
+                    if (!btn) {
+                        const buttons = document.querySelectorAll('button');
+                        for (const b of buttons) {
+                            if (b.disabled) continue;
+                            const label = ((b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('title') || '') + ' ' + (b.textContent || '')).trim();
+                            if (/\bnext\b/i.test(label)) { btn = b; break; }
+                            if (page != null && Number((b.textContent || '').trim()) === page + 1) { btn = b; break; }
+                        }
+                    }
+                    return btn && !btn.disabled ? btn : null;
+                };
+                const clickNext = (page, onFail) => {
+                    let tries = 0;
+                    const iv = setInterval(() => {
+                        const btn = findNextButton(page);
+                        if (btn) { btn.click(); clearInterval(iv); }
+                        else if (++tries > 50) { clearInterval(iv); if (onFail) onFail(); }
+                    }, 100);
+                };
+                const scrapeDom = () => {
+                    try {
+                        const anchors = document.querySelectorAll("a[href*='/title/']");
+                        const re = /\/title\/[^/]+\/(\d+)(?:-chapter-([\d.]+))?/i;
+                        const numRe = /(?:ch(?:apter)?\.?\s*)([\d.]+)/i;
+                        for (const a of anchors) {
+                            const href = a.getAttribute('href') || '';
+                            const m = href.match(re);
+                            if (!m) continue;
+                            const id = m[1];
+                            if (state.seenIds.has(id)) continue;
+                            state.seenIds.add(id);
+                            let number = m[2] ? Number(m[2]) : NaN;
+                            if (!Number.isFinite(number)) {
+                                const tm = (a.textContent || '').match(numRe);
+                                number = tm ? Number(tm[1]) : NaN;
+                            }
+                            if (!Number.isFinite(number)) continue;
+                            state.items.push({
+                                id: Number(id) || id,
+                                number: number,
+                                name: (a.textContent || '').trim(),
+                                url: href.split('?')[0].split('#')[0],
+                                isOfficial: false
+                            });
+                            state.gotAny = true;
+                            state.lastChange = Date.now();
+                        }
+                    } catch (e) {}
+                };
+
+                for (let i = 0; i < 200 && !state.gotAny; i++) {
+                    state = ensure();
+                    if (i === 40 || i === 100) scrapeDom();
+                    await sleep(100);
+                }
+                scrapeDom();
+                if (state.gotAny) {
+                    let lastN = state.items.length, stop = false;
+                    let currentPage = Math.max(...Array.from(state.seenPages), 1);
+                    clickNext(currentPage, () => { stop = true; });
+                    for (let i = 0; i < 900; i++) {
+                        if (state.seenPages.size >= Math.min(state.lastPage, 300)) break;
+                        if (state.items.length !== lastN) {
+                            lastN = state.items.length;
+                            stop = false;
+                            currentPage = Math.max(...Array.from(state.seenPages), 1);
+                            if (state.seenPages.size < 300) clickNext(currentPage, () => { stop = true; });
+                        }
+                        if (stop && (Date.now() - state.lastChange) > 3000) break;
+                        if ((Date.now() - state.lastChange) > 12000) break;
+                        await sleep(100);
+                    }
+                } else {
+                    scrapeDom();
+                }
+                return JSON.stringify({ items: state.items });
+            })()
+        """
+
+        // evaluateJs poll script: returns null while loading, JSON string when ready.
+        private const val CHAPTER_POLL_SCRIPT = """
+            (function () {
+                if (!window.__comixChapterState) {
+                    $CHAPTER_BOOTSTRAP_SCRIPT
+                    window.__comixChapterPoll = { started: Date.now(), nextClicks: 0, lastLen: 0, idleTicks: 0 };
+                }
+                const state = window.__comixChapterState;
+                const poll = window.__comixChapterPoll || (window.__comixChapterPoll = { started: Date.now(), nextClicks: 0, lastLen: 0, idleTicks: 0 });
+                const scrapeDom = () => {
+                    try {
+                        const anchors = document.querySelectorAll("a[href*='/title/']");
+                        const re = /\/title\/[^/]+\/(\d+)(?:-chapter-([\d.]+))?/i;
+                        const numRe = /(?:ch(?:apter)?\.?\s*)([\d.]+)/i;
+                        for (const a of anchors) {
+                            const href = a.getAttribute('href') || '';
+                            const m = href.match(re);
+                            if (!m) continue;
+                            const id = m[1];
+                            if (state.seenIds.has(id)) continue;
+                            state.seenIds.add(id);
+                            let number = m[2] ? Number(m[2]) : NaN;
+                            if (!Number.isFinite(number)) {
+                                const tm = (a.textContent || '').match(numRe);
+                                number = tm ? Number(tm[1]) : NaN;
+                            }
+                            if (!Number.isFinite(number)) continue;
+                            state.items.push({
+                                id: Number(id) || id,
+                                number: number,
+                                name: (a.textContent || '').trim(),
+                                url: href.split('?')[0].split('#')[0],
+                                isOfficial: false
+                            });
+                            state.gotAny = true;
+                            state.lastChange = Date.now();
+                        }
+                    } catch (e) {}
+                };
+                scrapeDom();
+                if (state.gotAny) {
+                    let btn = document.querySelector('.mchap-foot button[aria-label*=Next i], .mchap-foot button[aria-label*=next]');
+                    if (!btn) {
+                        const buttons = document.querySelectorAll('button');
+                        for (const b of buttons) {
+                            if (b.disabled) continue;
+                            const label = ((b.getAttribute('aria-label') || '') + ' ' + (b.textContent || '')).trim();
+                            if (/\bnext\b/i.test(label)) { btn = b; break; }
+                        }
+                    }
+                    if (btn && !btn.disabled && poll.nextClicks < 250 && state.seenPages.size < Math.min(state.lastPage, 300)) {
+                        btn.click();
+                        poll.nextClicks += 1;
+                    }
+                }
+                if (state.items.length !== poll.lastLen) {
+                    poll.lastLen = state.items.length;
+                    poll.idleTicks = 0;
+                } else {
+                    poll.idleTicks += 1;
+                }
+                const elapsed = Date.now() - poll.started;
+                const done = state.items.length > 0 && (
+                    poll.idleTicks >= 4 ||
+                    state.seenPages.size >= Math.min(state.lastPage, 300) ||
+                    elapsed > 75000
+                );
+                const giveUp = state.items.length === 0 && elapsed > 25000;
+                if (done) return JSON.stringify({ items: state.items });
+                if (giveUp) {
+                    scrapeDom();
+                    return state.items.length > 0 ? JSON.stringify({ items: state.items }) : null;
+                }
+                return null;
+            })()
+        """
+
+        // Captures the chapter list the title page loads (signed/encrypted XHR the
+        // SPA decrypts). IMPORTANT: pure single-team first pages MUST be kept —
+        // dropping them left the list empty when Comix serves one team by default.
+        // Also tries script#initial-data, then paginates via the Next button.
         // Resolves with `{ items: [...] }`.
         private const val CHAPTER_SCRIPT = """
             (async () => {
                 const original = JSON.parse;
                 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-                const mixedItems = [];
-                const mixedSeen = new Set();
-                const pureItems = [];
-                const purePages = new Set();
-                let targetGid = null;
-                let pureLastPage = 1;
-                let sawMixed = false;
+                const allItems = [];
+                const seenPages = new Set();
+                const seenIds = new Set();
+                let lastPage = 1;
+                let gotAny = false;
 
+                const chapterId = (ch) => {
+                    if (!ch) return null;
+                    if (ch.id != null) return String(ch.id);
+                    if (ch.hid != null) return String(ch.hid);
+                    return null;
+                };
+                const chapterNumber = (ch) => {
+                    if (!ch) return null;
+                    if (ch.number != null) return Number(ch.number);
+                    if (ch.chapter_number != null) return Number(ch.chapter_number);
+                    return null;
+                };
                 const isChapters = (arr) =>
                     Array.isArray(arr) && arr.length > 0 && arr[0] &&
-                    arr[0].id !== undefined && arr[0].number !== undefined;
+                    chapterId(arr[0]) != null && chapterNumber(arr[0]) != null;
+
+                const pushItems = (arr, page, last) => {
+                    if (!isChapters(arr)) return false;
+                    const p = Number(page || 1);
+                    if (seenPages.has(p)) return true;
+                    seenPages.add(p);
+                    if (last && Number(last) > lastPage) lastPage = Number(last);
+                    for (const ch of arr) {
+                        const id = chapterId(ch);
+                        if (id != null && seenIds.has(id)) continue;
+                        if (id != null) seenIds.add(id);
+                        // Normalize fields so Kotlin parsing stays simple.
+                        if (ch.number == null && ch.chapter_number != null) ch.number = ch.chapter_number;
+                        allItems.push(ch);
+                    }
+                    gotAny = allItems.length > 0;
+                    return true;
+                };
 
                 const onParsed = (parsed) => {
                     try {
@@ -894,19 +1350,11 @@ internal class Comix(context: MangaLoaderContext) :
                         const arr = result && result.items;
                         if (!isChapters(arr)) return;
                         const meta = (result.meta || result.pagination) || {};
-                        const page = Number(meta.page || 1);
-                        const lastPage = Number(
+                        pushItems(
+                            arr,
+                            meta.page || 1,
                             meta.lastPage || meta.last_page || meta.totalPages || meta.total_pages || 1
-                        ) || 1;
-                        const gid0 = arr[0].groupId != null ? String(arr[0].groupId) : null;
-                        const pure = gid0 != null && arr.every((ch) => String(ch.groupId) === gid0);
-                        if (pure && targetGid != null && gid0 === targetGid) {
-                            if (!purePages.has(page)) { purePages.add(page); for (const ch of arr) pureItems.push(ch); }
-                            if (lastPage > pureLastPage) pureLastPage = lastPage;
-                        } else if (!pure) {
-                            sawMixed = true;
-                            if (!mixedSeen.has(page)) { mixedSeen.add(page); for (const ch of arr) mixedItems.push(ch); }
-                        }
+                        );
                     } catch (e) {}
                 };
 
@@ -926,76 +1374,103 @@ internal class Comix(context: MangaLoaderContext) :
                     return os.apply(this, arguments);
                 };
 
-                const setGroup = (gid) => {
-                    try {
-                        const u = new URL(window.location.href);
-                        if (gid == null) u.searchParams.delete('group_id');
-                        else u.searchParams.set('group_id', String(gid));
-                        u.searchParams.delete('page');
-                        history.pushState({}, '', u.pathname + (u.search || ''));
-                        window.dispatchEvent(new PopStateEvent('popstate'));
-                    } catch (e) {}
-                };
-
-                const clickNext = (onFail) => {
-                    let tries = 0;
-                    const iv = setInterval(() => {
-                        let btn = document.querySelector('.mchap-foot button[aria-label*=Next]');
-                        if (!btn) {
-                            const buttons = document.querySelectorAll('button');
-                            for (const b of buttons) {
-                                const label = (b.getAttribute('aria-label') || '') + ' ' + (b.textContent || '');
-                                if (/next/i.test(label) && !b.disabled) { btn = b; break; }
+                // Seed from SSR initial-data if present.
+                try {
+                    const raw = document.querySelector('script#initial-data')?.textContent;
+                    if (raw) {
+                        const data = original(raw);
+                        const queries = data && data.queries;
+                        if (queries) {
+                            for (const key of Object.keys(queries)) {
+                                try { onParsed(queries[key]); } catch (e) {}
                             }
                         }
-                        if (btn && !btn.disabled) { btn.click(); clearInterval(iv); }
-                        else if (++tries > 40) { clearInterval(iv); if (onFail) onFail(); }
+                    }
+                } catch (e) {}
+
+                const findNextButton = (page) => {
+                    let btn = document.querySelector('.mchap-foot button[aria-label*=Next i], .mchap-foot button[aria-label*=next]');
+                    if (!btn) {
+                        const buttons = document.querySelectorAll('button');
+                        for (const b of buttons) {
+                            if (b.disabled) continue;
+                            const label = ((b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('title') || '') + ' ' + (b.textContent || '')).trim();
+                            if (/\bnext\b/i.test(label)) { btn = b; break; }
+                            if (page != null && Number((b.textContent || '').trim()) === page + 1) { btn = b; break; }
+                        }
+                    }
+                    return btn && !btn.disabled ? btn : null;
+                };
+
+                const clickNext = (page, onFail) => {
+                    let tries = 0;
+                    const iv = setInterval(() => {
+                        const btn = findNextButton(page);
+                        if (btn) { btn.click(); clearInterval(iv); }
+                        else if (++tries > 50) { clearInterval(iv); if (onFail) onFail(); }
                     }, 100);
                 };
 
-                // 1) Wait for the page's own all-teams first request.
-                for (let i = 0; i < 150 && !sawMixed; i++) await sleep(100);
+                // Wait for first chapter payload (network or SSR).
+                for (let i = 0; i < 180 && !gotAny; i++) await sleep(100);
 
-                // 2) Pick the team that appears most on the first page (tie: newest).
-                const counts = {};
-                for (const ch of mixedItems) { const g = ch.groupId; if (g != null) counts[String(g)] = (counts[String(g)] || 0) + 1; }
-                let best = null, bestC = -1;
-                for (const g in counts) { if (counts[g] > bestC) { bestC = counts[g]; best = g; } }
-                if (best == null && mixedItems[0] && mixedItems[0].groupId != null) best = String(mixedItems[0].groupId);
-
-                // 3) Switch the URL to that team and paginate within it.
-                if (best != null) {
-                    targetGid = best;
-                    setGroup(best);
-                    let got = false;
-                    for (let i = 0; i < 70; i++) { if (purePages.size > 0) { got = true; break; } await sleep(100); }
-                    if (got) {
-                        let last = Date.now(), lastN = pureItems.length, stop = false;
-                        clickNext(() => { stop = true; });
-                        for (let i = 0; i < 900; i++) {
-                            if (purePages.size >= Math.min(pureLastPage, 300)) break;
-                            if (pureItems.length !== lastN) { lastN = pureItems.length; last = Date.now(); stop = false; if (purePages.size < 300) clickNext(() => { stop = true; }); }
-                            if (stop && (Date.now() - last) > 3000) break;
-                            if ((Date.now() - last) > 12000) break;
-                            await sleep(100);
+                if (gotAny) {
+                    let last = Date.now(), lastN = allItems.length, stop = false;
+                    let currentPage = Math.max(...Array.from(seenPages), 1);
+                    clickNext(currentPage, () => { stop = true; });
+                    for (let i = 0; i < 900; i++) {
+                        if (seenPages.size >= Math.min(lastPage, 300)) break;
+                        if (allItems.length !== lastN) {
+                            lastN = allItems.length;
+                            last = Date.now();
+                            stop = false;
+                            currentPage = Math.max(...Array.from(seenPages), 1);
+                            if (seenPages.size < 300) clickNext(currentPage, () => { stop = true; });
                         }
-                        if (pureItems.length > 0) return JSON.stringify({ items: pureItems });
+                        if (stop && (Date.now() - last) > 3000) break;
+                        if ((Date.now() - last) > 12000) break;
+                        await sleep(100);
                     }
                 }
 
-                // 4) Fallback: paginate every team via the "Next" button.
-                setGroup(null);
-                let last = Date.now(), lastN = mixedItems.length, stop = false;
-                clickNext(() => { stop = true; });
-                for (let i = 0; i < 800; i++) {
-                    if (mixedItems.length !== lastN) { lastN = mixedItems.length; last = Date.now(); stop = false; if (mixedSeen.size < 250) clickNext(() => { stop = true; }); }
-                    if (stop && (Date.now() - last) > 3000) break;
-                    if (mixedItems.length > 0 && (Date.now() - last) > 9000) break;
-                    await sleep(100);
+                // DOM fallback if network capture returned nothing.
+                if (allItems.length === 0) {
+                    try {
+                        const anchors = document.querySelectorAll("a[href*='/title/']");
+                        const re = /\/title\/[^/]+\/(\d+)(?:-chapter-([\d.]+))?/i;
+                        const numRe = /(?:ch(?:apter)?\.?\s*)([\d.]+)/i;
+                        for (const a of anchors) {
+                            const href = a.getAttribute('href') || '';
+                            const m = href.match(re);
+                            if (!m) continue;
+                            const id = m[1];
+                            if (seenIds.has(id)) continue;
+                            seenIds.add(id);
+                            let number = m[2] ? Number(m[2]) : NaN;
+                            if (!Number.isFinite(number)) {
+                                const tm = (a.textContent || '').match(numRe);
+                                number = tm ? Number(tm[1]) : NaN;
+                            }
+                            if (!Number.isFinite(number)) continue;
+                            allItems.push({
+                                id: Number(id) || id,
+                                number: number,
+                                name: (a.textContent || '').trim(),
+                                url: href.split('?')[0].split('#')[0],
+                                isOfficial: false
+                            });
+                        }
+                    } catch (e) {}
                 }
-                return JSON.stringify({ items: mixedItems });
+
+                return JSON.stringify({ items: allItems });
             })()
         """
+
+        private val CHAPTER_HREF_REGEX =
+            Regex("""/title/[^/]+/(\d+)(?:-chapter-([\d.]+))?""", RegexOption.IGNORE_CASE)
+        private val CHAPTER_NUM_TEXT_REGEX =
+            Regex("""(?:ch(?:apter)?\.?\s*)([\d.]+)""", RegexOption.IGNORE_CASE)
 
         // Browse results arrive via a signed, encrypted XHR the page decrypts in
         // JS, so we hook `JSON.parse` (catches the decrypted object), `fetch` and
