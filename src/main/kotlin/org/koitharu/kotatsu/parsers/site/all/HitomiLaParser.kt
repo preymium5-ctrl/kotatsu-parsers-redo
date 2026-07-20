@@ -81,14 +81,55 @@ internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser
 		get() = MangaListFilterCapabilities(
 			isMultipleTagsSupported = true,
 			isSearchSupported = true,
+			isSearchWithFiltersSupported = true,
 		)
 
 	override suspend fun getFilterOptions() = MangaListFilterOptions(
 		availableTags = fetchAvailableTags(),
-		availableLocales = setOf(Locale.ENGLISH),
+		// Full locale list so non-English + language-null GameCG/ArtistCG can appear.
+		// Use content-type filters (Game CG / Artist CG / Image set) for CGI galleries.
+		availableLocales = localeMap.keys,
+		availableContentTypes = EnumSet.of(
+			ContentType.DOUJINSHI,
+			ContentType.MANGA,
+			ContentType.ARTIST_CG,
+			ContentType.GAME_CG,
+			ContentType.IMAGE_SET,
+			ContentType.OTHER, // anime on hitomi
+		),
 	)
 
-	private fun Locale?.getSiteLang(): String = "english"
+	/**
+	 * Hitomi language segment in nozomi paths.
+	 * GameCG / ArtistCG / ImageSet often have `language: null` on the site and only
+	 * exist in `*-all.nozomi` indexes — forcing "english" hid those entirely.
+	 */
+	private fun Locale?.getSiteLang(preferAllForCgs: Boolean = false): String {
+		if (preferAllForCgs) return "all"
+		return when (this) {
+			null -> "all"
+			else -> localeMap[this] ?: "all"
+		}
+	}
+
+	private fun ContentType.toHitomiType(): String? = when (this) {
+		ContentType.GAME_CG -> "gamecg"
+		ContentType.ARTIST_CG -> "artistcg"
+		ContentType.IMAGE_SET -> "imageset"
+		ContentType.DOUJINSHI -> "doujinshi"
+		ContentType.MANGA -> "manga"
+		ContentType.OTHER -> "anime"
+		else -> null
+	}
+
+	/** Parse a gallery id from raw id, hitomi URL, or path like /gamecg/title-3682932.html */
+	private fun extractGalleryId(query: String?): Int? {
+		if (query.isNullOrBlank()) return null
+		val q = query.trim()
+		q.toIntOrNull()?.takeIf { it > 0 }?.let { return it }
+		HITOMI_GALLERY_ID_REGEX.find(q)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { return it }
+		return null
+	}
 
 	private suspend fun fetchAvailableTags(): Set<MangaTag> = coroutineScope {
 		('a'..'z').map { alphabet ->
@@ -122,71 +163,77 @@ internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser
 
 	private var cachedSearchIds: List<Int> = emptyList()
 
-	override suspend fun getList(offset: Int, order: SortOrder, filter: MangaListFilter): List<Manga> = when {
-		filter.query.isNullOrEmpty() -> {
-
-			if (filter.tags.isEmpty()) {
-				when (order) {
-					SortOrder.POPULARITY_TODAY -> {
-						getGalleryIDsFromNozomi(
-							"popular",
-							"today",
-							filter.locale.getSiteLang(),
-							offset.nextOffsetRange(),
-						)
-					}
-
-					SortOrder.POPULARITY_WEEK -> {
-						getGalleryIDsFromNozomi(
-							"popular",
-							"week",
-							filter.locale.getSiteLang(),
-							offset.nextOffsetRange(),
-						)
-					}
-
-					SortOrder.POPULARITY_MONTH -> {
-						getGalleryIDsFromNozomi(
-							"popular",
-							"month",
-							filter.locale.getSiteLang(),
-							offset.nextOffsetRange(),
-						)
-					}
-
-					SortOrder.POPULARITY_YEAR -> {
-						getGalleryIDsFromNozomi(
-							"popular",
-							"year",
-							filter.locale.getSiteLang(),
-							offset.nextOffsetRange(),
-						)
-					}
-
-					else -> {
-						getGalleryIDsFromNozomi(null, "index", filter.locale.getSiteLang(), offset.nextOffsetRange())
-					}
-				}
+	override suspend fun getList(offset: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
+		// Direct open: gallery id or full URL (e.g. hitomi.la/gamecg/seasons-of-loss-3682932.html)
+		extractGalleryId(filter.query)?.let { galleryId ->
+			return if (offset == 0) {
+				listOf(galleryId).toMangaList()
 			} else {
-				if (offset == 0) {
-					cachedSearchIds =
-						hitomiSearch(
-							filter.tags.joinToString(" ") { it.key },
-							order,
-							filter.locale.getSiteLang(),
-						).toList()
-				}
-				cachedSearchIds.subList(offset, min(offset + 25, cachedSearchIds.size))
+				emptyList()
 			}
 		}
 
-		else -> {
-			if (offset == 0) {
-				cachedSearchIds = hitomiSearch(filter.query, order, filter.locale.getSiteLang()).toList()
+		val hitomiType = filter.types.firstNotNullOfOrNull { it.toHitomiType() }
+		// CGI galleries frequently have no language tag — use "all" for type indexes.
+		val isCgiType = hitomiType in setOf("gamecg", "artistcg", "imageset")
+		val lang = filter.locale.getSiteLang(preferAllForCgs = isCgiType)
+
+		val ids: Collection<Int> = when {
+			// Browse by content type only (Game CG / Artist CG / Image set / …)
+			// type/gamecg-all.nozomi — language-null CGI lives here, not in *-english.nozomi
+			!hitomiType.isNullOrEmpty() && filter.tags.isEmpty() && filter.query.isNullOrEmpty() -> {
+				when (order) {
+					SortOrder.POPULARITY_TODAY,
+					SortOrder.POPULARITY_WEEK,
+					SortOrder.POPULARITY_MONTH,
+					SortOrder.POPULARITY_YEAR,
+					-> {
+						// Popular indexes are not type-scoped: search type:gamecg against popular.
+						if (offset == 0) {
+							cachedSearchIds = hitomiSearch("type:$hitomiType", order, "all").toList()
+						}
+						cachedSearchIds.page(offset)
+					}
+					else -> getGalleryIDsFromNozomi("type", hitomiType, "all", offset.nextOffsetRange())
+				}
 			}
-			cachedSearchIds.subList(offset, min(offset + 25, cachedSearchIds.size))
+
+			filter.query.isNullOrEmpty() && filter.tags.isEmpty() -> {
+				when (order) {
+					SortOrder.POPULARITY_TODAY ->
+						getGalleryIDsFromNozomi("popular", "today", lang, offset.nextOffsetRange())
+					SortOrder.POPULARITY_WEEK ->
+						getGalleryIDsFromNozomi("popular", "week", lang, offset.nextOffsetRange())
+					SortOrder.POPULARITY_MONTH ->
+						getGalleryIDsFromNozomi("popular", "month", lang, offset.nextOffsetRange())
+					SortOrder.POPULARITY_YEAR ->
+						getGalleryIDsFromNozomi("popular", "year", lang, offset.nextOffsetRange())
+					else ->
+						getGalleryIDsFromNozomi(null, "index", lang, offset.nextOffsetRange())
+				}
+			}
+
+			else -> {
+				if (offset == 0) {
+					val terms = buildList {
+						filter.query?.takeIf { it.isNotBlank() }?.let(::add)
+						filter.tags.forEach { add(it.key) }
+						hitomiType?.let { add("type:$it") }
+					}.joinToString(" ")
+					// CGI / typed searches must use "all" so language-null galleries match.
+					val searchLang = if (isCgiType || hitomiType != null) "all" else lang
+					cachedSearchIds = hitomiSearch(terms, order, searchLang).toList()
+				}
+				cachedSearchIds.page(offset)
+			}
 		}
-	}.toMangaList()
+		return ids.toMangaList()
+	}
+
+	private fun List<Int>.page(offset: Int): List<Int> {
+		if (isEmpty() || offset >= size) return emptyList()
+		return subList(offset, min(offset + 25, size))
+	}
 
 	private fun Int.nextOffsetRange(): LongRange {
 		val bytes = this * 4L
@@ -537,7 +584,9 @@ internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser
 	}
 
 	override suspend fun getDetails(manga: Manga): Manga {
-		val json = webClient.httpGet("$ltnBaseUrl/galleries/${manga.url}.js")
+		val galleryId = extractGalleryId(manga.url) ?: manga.url.toIntOrNull()
+			?: error("Invalid Hitomi gallery id: ${manga.url}")
+		val json = webClient.httpGet("$ltnBaseUrl/galleries/$galleryId.js")
 			.parseRaw()
 			.substringAfter("var galleryinfo = ")
 			.let(::JSONObject)
@@ -545,8 +594,20 @@ internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser
 			json.optJSONArray("artists")
 				?.mapJSON { it.getString("artist").toCamelCase() }
 				?.joinToString()
+		val typeKey = json.getStringOrNull("type")?.lowercase().orEmpty()
+		val typeTitle = when (typeKey) {
+			"gamecg" -> "Game CG"
+			"artistcg" -> "Artist CG"
+			"imageset" -> "Image Set"
+			"doujinshi" -> "Doujinshi"
+			"manga" -> "Manga"
+			"anime" -> "Anime"
+			else -> typeKey.toTitleCase().ifEmpty { null }
+		}
 
 		return manga.copy(
+			id = generateUid(galleryId.toString()),
+			url = galleryId.toString(),
 			title = json.getString("title"),
 			largeCoverUrl =
 				json.getJSONArray("files").getJSONObject(0).let {
@@ -559,8 +620,17 @@ internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser
 			authors = setOfNotNull(author),
 			publicUrl = json.getString("galleryurl").toAbsoluteUrl(domain),
 			tags =
-				buildSet
-				{
+				buildSet {
+					// Surface CGI / type as a first-class tag for chips + ComicTypeClassifier.
+					if (!typeTitle.isNullOrEmpty() && typeKey.isNotEmpty()) {
+						add(
+							MangaTag(
+								title = typeTitle,
+								key = "type:$typeKey",
+								source = source,
+							),
+						)
+					}
 					json.optJSONArray("characters")
 						?.mapToTags("character")
 						?.let(::addAll)
@@ -579,13 +649,15 @@ internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser
 				},
 			chapters = listOf(
 				MangaChapter(
-					id = generateUid(manga.url),
-					url = manga.url,
+					id = generateUid(galleryId.toString()),
+					url = galleryId.toString(),
 					title = json.getStringOrNull("title"),
-					scanlator = json.getString("type").toTitleCase(),
+					scanlator = typeTitle,
 					number = 1f,
 					volume = 0,
-					branch = json.getString("language_localname"),
+					branch = json.getStringOrNull("language_localname")
+						?: json.getStringOrNull("language")
+						?: "All",
 					source = source,
 					uploadDate = dateFormat.parseSafe(json.getString("date").substringBeforeLast("-")),
 				),
@@ -633,7 +705,9 @@ internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser
 	}
 
 	override suspend fun getRelatedManga(seed: Manga): List<Manga> {
-		val json = webClient.httpGet("$ltnBaseUrl/galleries/${seed.url}.js")
+		val galleryId = extractGalleryId(seed.url) ?: seed.url.toIntOrNull()
+			?: return emptyList()
+		val json = webClient.httpGet("$ltnBaseUrl/galleries/$galleryId.js")
 			.parseRaw()
 			.substringAfter("var galleryinfo = ")
 			.let(::JSONObject)
@@ -645,7 +719,9 @@ internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser
 	}
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-		val json = webClient.httpGet("$ltnBaseUrl/galleries/${chapter.url}.js")
+		val galleryId = extractGalleryId(chapter.url) ?: chapter.url.toIntOrNull()
+			?: error("Invalid Hitomi gallery id: ${chapter.url}")
+		val json = webClient.httpGet("$ltnBaseUrl/galleries/$galleryId.js")
 			.parseRaw()
 			.substringAfter("var galleryinfo = ")
 			.let(::JSONObject)
@@ -656,9 +732,20 @@ internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser
 			val imageId = imageIdFromHash(hash)
 			val subDomain = subdomainOffset(imageId) + 1
 			val thumbSubdomain = 'a' + subdomainOffset(imageId)
+			// Prefer AVIF when available; fall back to webp then original extension.
+			// Some CGI motion frames are gif/webp — keep extension that the CDN expects.
+			val ext = when {
+				image.optInt("hasavif", 0) == 1 -> "avif"
+				image.optInt("haswebp", 0) == 1 -> "webp"
+				else -> image.getStringOrNull("name")
+					?.substringAfterLast('.', "")
+					?.lowercase()
+					?.takeIf { it in setOf("webp", "avif", "gif", "png", "jpg", "jpeg") }
+					?: "webp"
+			}
 			MangaPage(
 				id = generateUid(hash),
-				url = "https://a${subDomain}.$cdnDomain/$commonId$imageId/$hash.avif",
+				url = "https://a$subDomain.$cdnDomain/$commonId$imageId/$hash.$ext",
 				preview = "https://${thumbSubdomain}tn.$cdnDomain/webpsmallsmalltn/${thumbPathFromHash(hash)}/$hash.webp",
 				source = source,
 			)
@@ -766,5 +853,10 @@ internal class HitomiLaParser(context: MangaLoaderContext) : AbstractMangaParser
 		return toCamelCase()
 			.replace("♂", "(male)")
 			.replace("♀", "(female)")
+	}
+
+	private companion object {
+		private val HITOMI_GALLERY_ID_REGEX =
+			Regex("""(?:hitomi\.la/)?(?:[a-z0-9_-]+/)?[^\s/]*?(\d{4,})\.html""", RegexOption.IGNORE_CASE)
 	}
 }
