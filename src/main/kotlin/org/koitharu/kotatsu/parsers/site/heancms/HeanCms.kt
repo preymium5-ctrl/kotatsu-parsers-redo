@@ -174,18 +174,74 @@ internal abstract class HeanCms(
 
 	protected open val selectPages = ".flex > img:not([alt])"
 
+	/**
+	 * HeanCMS / OmegaScans etc. often ship a Next.js shell where chapter pages are not
+	 * present as classic `<img>` nodes. Free chapters embed page URLs as:
+	 * - `link[rel=preload][as=image]`
+	 * - escaped `media.*.org/.../uploads/series/.../NN.jpg` strings in the HTML
+	 *
+	 * Older completed titles commonly hit this path; empty selectors previously led the
+	 * reader to show "Content not found or removed" (HTTP 404 / empty page list).
+	 */
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val fullUrl = chapter.url.toAbsoluteUrl(domain)
 		val doc = webClient.httpGet(fullUrl).parseHtml()
-		return doc.select(selectPages).map { img ->
-			val url = img.requireSrc()
-			MangaPage(
+		val seen = LinkedHashSet<String>()
+		val result = ArrayList<MangaPage>(64)
+
+		fun addPage(rawUrl: String?) {
+			val url = rawUrl?.trim().orEmpty()
+			if (url.isEmpty() || !seen.add(url)) return
+			if (!isChapterPageImageUrl(url)) return
+			result += MangaPage(
 				id = generateUid(url),
 				url = url,
 				preview = null,
 				source = source,
 			)
 		}
+
+		// 1) Classic CMS markup
+		for (img in doc.select(selectPages)) {
+			runCatching { addPage(img.requireSrc()) }
+		}
+		if (result.isNotEmpty()) return result
+
+		// 2) Next.js preload links (OmegaScans free chapters)
+		for (link in doc.select("link[rel=preload][as=image], link[rel=preload][as=image][href]")) {
+			val href = link.attr("abs:href").ifBlank { link.attr("href") }
+			addPage(href)
+		}
+		if (result.isNotEmpty()) return result
+
+		// 3) Any series upload image URL embedded in the document (RSC / escaped JSON)
+		val html = doc.html()
+		PAGE_IMAGE_URL_REGEX.findAll(html).forEach { match ->
+			addPage(match.value.replace("\\/", "/").replace("\\u002F", "/"))
+		}
+		return result
+	}
+
+	protected open fun isChapterPageImageUrl(url: String): Boolean {
+		val lower = url.lowercase()
+		if (lower.contains("/_next/") || lower.contains("favicon") || lower.contains("icon.png")) {
+			return false
+		}
+		// Prefer real chapter page assets; skip generic thumbnails when possible.
+		val looksLikePageFile = lower.contains(".jpg") || lower.contains(".jpeg") ||
+			lower.contains(".png") || lower.contains(".webp")
+		if (!looksLikePageFile) return false
+		if (lower.contains("/uploads/series/")) return true
+		if (lower.contains("/file/") && !lower.contains("thumbnail")) return true
+		// Fallback for relative/other CDN layouts used by sister sites
+		return !lower.contains("thumbnail") && !lower.contains("cover")
+	}
+
+	private companion object {
+		val PAGE_IMAGE_URL_REGEX = Regex(
+			"""https?://[^\s"'\\<>]+?\.(?:jpe?g|png|webp)""",
+			RegexOption.IGNORE_CASE,
+		)
 	}
 
 	private suspend fun fetchAvailableTags(): Set<MangaTag> {
