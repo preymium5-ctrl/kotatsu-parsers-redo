@@ -30,6 +30,7 @@ import org.koitharu.kotatsu.parsers.util.parseHtml
 import org.koitharu.kotatsu.parsers.util.toAbsoluteUrl
 import org.koitharu.kotatsu.parsers.util.toTitleCase
 import org.koitharu.kotatsu.parsers.util.urlEncoded
+import java.net.URI
 import java.text.SimpleDateFormat
 import java.util.EnumSet
 import java.util.Locale
@@ -171,15 +172,15 @@ internal class ManhwaReadParser(context: MangaLoaderContext) :
 		} == true
 
 		val dateFormat = SimpleDateFormat("dd/MM/yyyy", Locale.US)
+		val mangaPath = normalizePath(manga.url)
 		val chapters = doc.select("a.chapter-item[href*=/chapter-], a.chapter-item[href*=/manhwa/]")
 			.mapNotNull { a ->
 				val href = a.attr("href").trim()
 				if (href.isEmpty() || !href.contains("/chapter-")) return@mapNotNull null
-				val path = if (href.startsWith("http")) {
-					href.removePrefix("https://$domain").removePrefix("http://$domain")
-				} else {
-					href
-				}
+				val path = normalizePath(href)
+				// The details page also contains `.chapter-item` links inside "More Like This".
+				// Only chapters whose parent slug matches the requested manga belong in this list.
+				if (!isManhwaReadChapterPath(path, mangaPath)) return@mapNotNull null
 				val text = a.text().replace(Regex("\\s+"), " ").trim()
 				val dateText = Regex("""(\d{2}/\d{2}/\d{4})""").find(text)?.groupValues?.get(1)
 				val number = Regex("""(?i)chapter\s*([0-9]+(?:\.[0-9]+)?)""")
@@ -417,6 +418,15 @@ internal class ManhwaReadParser(context: MangaLoaderContext) :
 		else -> "release"
 	}
 
+	private fun normalizePath(url: String): String {
+		val path = if (url.contains("://")) {
+			runCatching { URI(url).rawPath }.getOrNull().orEmpty()
+		} else {
+			url.substringBefore('?').substringBefore('#')
+		}
+		return "/${path.trim('/')}"
+	}
+
 	private companion object {
 		/** Captures the `{...}` object assigned to `var chapterData`. */
 		val CHAPTER_DATA_REGEX = Regex(
@@ -424,4 +434,9 @@ internal class ManhwaReadParser(context: MangaLoaderContext) :
 			setOf(RegexOption.DOT_MATCHES_ALL),
 		)
 	}
+}
+
+internal fun isManhwaReadChapterPath(chapterPath: String, mangaPath: String): Boolean {
+	val expectedPrefix = mangaPath.trimEnd('/') + "/chapter-"
+	return chapterPath.startsWith(expectedPrefix, ignoreCase = true)
 }
