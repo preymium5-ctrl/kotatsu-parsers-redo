@@ -1,9 +1,12 @@
 package org.koitharu.kotatsu.parsers.site.en
 
+import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
+import org.koitharu.kotatsu.parsers.exception.ParseException
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.util.*
 import java.text.SimpleDateFormat
@@ -73,7 +76,7 @@ internal class ErisScans(context: MangaLoaderContext) :
 		return all.drop((page - 1).coerceAtLeast(0) * PAGE_SIZE).take(PAGE_SIZE)
 	}
 
-	private fun parseMangaList(doc: org.jsoup.nodes.Document): List<Manga> {
+	private fun parseMangaList(doc: Document): List<Manga> {
 		val result = LinkedHashMap<String, Manga>()
 		for (coverLink in doc.select("a[href^=/series/][title]")) {
 			val coverStyle = coverLink.attr("style").takeIf { "background-image" in it }
@@ -119,13 +122,15 @@ internal class ErisScans(context: MangaLoaderContext) :
 	override suspend fun getDetails(manga: Manga): Manga {
 		val doc = webClient.httpGet(manga.url.toAbsoluteUrl(domain)).parseHtml()
 		val chapters = LinkedHashMap<String, MangaChapter>()
-		for (a in doc.select("a[href^=/chapter/][title]")) {
+		for (a in doc.selectChapterRows()) {
 			val url = a.attrAsRelativeUrlOrNull("href") ?: continue
-			if (url in chapters || isPaidChapter(a.attr("c"))) continue
-			val title = a.attr("title").trim().ifEmpty { a.text().trim() }
+			if (url in chapters) continue
+			val title = a.attr("title").trim()
+				.ifEmpty { a.attr("alt").trim() }
+				.ifEmpty { a.selectFirst("span.truncate")?.text()?.trim().orEmpty() }
 			chapters[url] = MangaChapter(
 				id = generateUid(url),
-				title = title,
+				title = if (a.isLockedChapter()) LOCKED_TITLE_PREFIX + title else title,
 				number = CHAPTER_NUMBER_REGEX.find(title)?.groupValues?.getOrNull(1)?.toFloatOrNull() ?: 0f,
 				volume = 0,
 				url = url,
@@ -166,14 +171,37 @@ internal class ErisScans(context: MangaLoaderContext) :
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val doc = webClient.httpGet(chapter.url.toAbsoluteUrl(domain)).parseHtml()
-		return doc.select("#pages img.myImage[uid]").mapNotNull { img ->
+		val container = doc.selectFirst("#pages")
+			?: throw ParseException(
+				"This chapter is locked and has to be unlocked with coins on the website first.",
+				chapter.url,
+			)
+		return container.select("img.myImage[uid]").mapNotNull { img ->
 			val uid = img.attr("uid").trim().ifEmpty { return@mapNotNull null }
 			val url = "https://cdn.meowing.org/uploads/$uid"
 			MangaPage(id = generateUid(url), url = url, preview = null, source = source)
 		}
 	}
 
-	private fun isPaidChapter(rawPrice: String): Boolean = rawPrice.toIntOrNull()?.let { it > 1 } == true
+	/**
+	 * The chapter list lives in the `#chapters` grid, where every row carries the release date in
+	 * `d` and the coin price in `c`. The "first chapter" / "latest chapter" shortcuts above the
+	 * list link to the same urls but without any metadata, so they must not be parsed as rows:
+	 * otherwise the newest locked chapter slips into the list with an unknown date while the
+	 * other locked ones are handled by [isLockedChapter], which leaves holes in the numbering.
+	 */
+	private fun Document.selectChapterRows(): List<Element> {
+		val rows = select("#chapters a[href^=/chapter/]")
+		return if (rows.isEmpty()) select("a[href^=/chapter/][d]") else rows
+	}
+
+	/**
+	 * Chapters costing more than one coin are paid early access: the site draws a lock over the
+	 * thumbnail and the reader page contains no images. They are still listed so that nothing
+	 * looks missing compared to the website, but the title is marked to show they are not free.
+	 */
+	private fun Element.isLockedChapter(): Boolean =
+		(attr("c").toIntOrNull() ?: 0) > 1 || selectFirst("img[src*=lock]") != null
 
 	private fun parseChapterDate(raw: String): Long {
 		val date = raw.trim()
@@ -193,6 +221,7 @@ internal class ErisScans(context: MangaLoaderContext) :
 
 	private companion object {
 		const val PAGE_SIZE = 20
+		const val LOCKED_TITLE_PREFIX = "\uD83D\uDD12 " // lock emoji
 		val BACKGROUND_URL_REGEX = Regex("""background-image\s*:\s*url\(([^)]+)\)""", RegexOption.IGNORE_CASE)
 		val CHAPTER_NUMBER_REGEX = Regex("""(?:chapter|ch\.?)[^\d]*(\d+(?:\.\d+)?)""", RegexOption.IGNORE_CASE)
 		val RELATIVE_DATE_REGEX = Regex("""(\d+)\s+(?:minute|hour|day|week|month|year)s?\s+ago""", RegexOption.IGNORE_CASE)
